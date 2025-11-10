@@ -360,6 +360,9 @@ class GKDTrainer(SFTTrainer):
 
             # Release hidden states after loss computation
             del student_hidden, teacher_hidden, true_labels
+
+            if num_items_in_batch is not None:
+                loss /= num_items_in_batch
         else:
             # compute student output
             student_outputs = model(
@@ -381,13 +384,19 @@ class GKDTrainer(SFTTrainer):
             shifted_teacher_logits = teacher_outputs.logits[:, prompt_lengths - 1 : -1, :]
             shifted_labels = inputs["labels"][:, prompt_lengths:]
 
+            reduction = "batchmean" if num_items_in_batch is None else "sum"
+
             # compute loss
             loss = self.generalized_jsd_loss(
                 student_logits=shifted_student_logits,
                 teacher_logits=shifted_teacher_logits,
                 labels=shifted_labels,
                 beta=self.beta,
+                reduction=reduction,
             )
+
+            if num_items_in_batch is not None:
+                loss = loss / num_items_in_batch
 
         # empty cache
         empty_cache()
