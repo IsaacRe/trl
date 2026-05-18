@@ -1,0 +1,56 @@
+# Full fine-tuning: Qwen3.5-2B on PhantomG27249/GLM-5.1-Reasoning-1M-Cleaned
+#
+# Run with:
+#   CUDA_VISIBLE_DEVICES=0 .venv/bin/trl sft --config configs/sft_full.yaml
+#
+# NOTE: The dataset's conversations use 'human'/'gpt' role names. TRL will
+# convert them to ChatML format, but if Qwen's chat template rejects those
+# roles, add a preprocessing step to remap 'human'→'user' and 'gpt'→'assistant'.
+
+# Dataset
+dataset_name: PhantomG27249/GLM-5.1-Reasoning-1M-Cleaned
+dataset_config: main
+dataset_train_split: train
+dataset_streaming: true
+
+# Model
+model_name_or_path: Qwen/Qwen3.5-2B
+dtype: bfloat16
+attn_implementation: sdpa
+
+# Output
+output_dir: outputs/qwen3.5-2b-sft-full
+report_to: none
+
+# Training hyperparameters
+# 1M samples / (4 per_device * 8 grad_accum) = 31,250 steps per epoch
+max_steps: 31250
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 32
+learning_rate: 2.0e-5
+lr_scheduler_type: cosine
+warmup_steps: 1562
+weight_decay: 0.01
+
+# Sequence length
+max_length: 4096
+packing: false
+
+# Precision & memory
+bf16: true
+gradient_checkpointing: true
+gradient_checkpointing_kwargs:
+  use_reentrant: false
+
+# Loss
+# loss_type: chunked_nll
+
+# Logging & evaluation
+logging_steps: 10
+eval_strategy: "no"
+save_strategy: steps
+save_steps: 500
+save_total_limit: 3
+
+# Misc
+dataloader_num_workers: 4
