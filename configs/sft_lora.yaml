@@ -36,12 +36,12 @@ report_to: none
 
 # Training hyperparameters
 # 1M samples / (8 per_device * 4 grad_accum) = 31,250 steps per epoch
-max_steps: 31250
+max_steps: 1000
 per_device_train_batch_size: 4
 gradient_accumulation_steps: 8
 learning_rate: 2.0e-4
 lr_scheduler_type: cosine
-warmup_steps: 1562
+warmup_ratio: 0.05
 weight_decay: 0.01
 
 # Sequence length
@@ -58,23 +58,19 @@ gradient_checkpointing_kwargs:
 # loss_type: chunked_nll
 
 # Logging & evaluation
-logging_steps: 10
+logging_steps: 1
 eval_strategy: steps
-eval_steps: 500
+eval_steps: 50
 save_strategy: steps
-save_steps: 500
-save_total_limit: 3
+save_steps: 200
+# save_total_limit: 3
 
 # Misc
 dataloader_num_workers: 1
 
-# Speculative decoding acceptance eval (optional)
-# Uncomment and fill in to enable. Requires eval_strategy != "no" above.
-# spec_dec_endpoint: http://localhost:8080/v1
-# spec_dec_model: GLM-5.1
-# spec_dec_api_key: EMPTY
-# spec_dec_n_drafts: 4
-# spec_dec_d_tokens: 8
-# spec_dec_n_eval_samples: 50
-# spec_dec_max_target_tokens: 512
-# spec_dec_draft_temperature: 1.0
+# Speculative decoding acceptance eval
+spec_dec_eval_dataset: Locutusque/hermes-agent-reasoning-traces-glm-5.1-formatted
+spec_dec_n_drafts: 4
+spec_dec_d_tokens: 8
+spec_dec_n_eval_samples: 1
+spec_dec_draft_temperature: 0.8
