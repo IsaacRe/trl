@@ -83,16 +83,21 @@ def main(script_args, training_args, model_args, dataset_args, spec_dec_args):
     dataset = dataset.map(remap_roles)
 
     # ------------------------------------------------------------------
-    # Eval dataset — carved from the head of the training stream.
-    # Used for both standard val loss and speculative acceptance eval.
-    # NOTE: these samples also appear in the training stream; at 1M samples
-    # the overlap is negligible but not zero.
+    # Eval dataset — either a separate held-out HF dataset or (fallback)
+    # the first N samples carved from the training stream.
     # ------------------------------------------------------------------
     n_eval = spec_dec_args.spec_dec_n_eval_samples
-    raw_eval = [
-        maybe_convert_to_chatml(dict(s))
-        for s in itertools.islice(dataset[script_args.dataset_train_split], n_eval)
-    ]
+    if spec_dec_args.spec_dec_eval_dataset:
+        _eval_stream = load_dataset(spec_dec_args.spec_dec_eval_dataset, streaming=True, split="train")
+        raw_eval = [
+            maybe_convert_to_chatml(remap_roles(dict(s)))
+            for s in itertools.islice(_eval_stream, n_eval)
+        ]
+    else:
+        raw_eval = [
+            maybe_convert_to_chatml(dict(s))
+            for s in itertools.islice(dataset[script_args.dataset_train_split], n_eval)
+        ]
     eval_dataset = Dataset.from_list(raw_eval) if training_args.eval_strategy != "no" else None
 
     # ------------------------------------------------------------------

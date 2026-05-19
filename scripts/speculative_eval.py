@@ -22,9 +22,9 @@ All positions k are 1-indexed relative to the start of each draft iteration.
 
 from __future__ import annotations
 
-import itertools
 import logging
 from dataclasses import dataclass, field
+import re
 
 import torch
 from tqdm.auto import tqdm
@@ -75,24 +75,48 @@ class SpecDecConfig:
         default=False,
         metadata={"help": "Skip training and run evaluation only."},
     )
+    spec_dec_eval_dataset: str = field(
+        default="",
+        metadata={"help": "HF dataset to use as the held-out eval set (repo id). If empty, falls back to carving from the training stream."},
+    )
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _prompt_text(messages: list[dict], tokenizer, enable_thinking=True) -> str:
-    """Format all messages up to (not including) the first assistant turn."""
-    prompt_msgs = list(itertools.takewhile(lambda m: m["role"] != "assistant", messages))
-    return tokenizer.apply_chat_template(prompt_msgs, tokenize=False, add_generation_prompt=True, enable_thinking=enable_thinking)
+def _qwen3_convert_glm_think_blocks(prompt: str) -> str:
+    # add second newline inside empty <think> blocks
+    converted = re.sub(r'<think>\n</think>', '<think>\n\n</think>', prompt)
+    # add second newline after </think>
+    converted = re.sub(r'</think>\n(?!\n)', '</think>\n\n', converted)
+    return converted
 
 
-def _assistant_text(messages: list[dict]) -> str:
-    """Return the first assistant message content, or empty string."""
-    for msg in messages:
-        if msg["role"] == "assistant":
-            return msg.get("content") or ""
-    return ""
+def _assistant_turns(messages: list[dict], tokenizer) -> list[tuple[str, str, list[dict]]]:
+    """
+    Return ``(context, target, turn_messages)`` for every assistant turn.
+
+    ``context`` is the templated prompt ending with the generation prefix (``<think>\\n``).
+    ``target`` is the assistant content with the leading ``<think>\\n`` stripped.
+    ``turn_messages`` is ``messages[:i+1]``, used for the parity check.
+    """
+    turns = []
+    for i, msg in enumerate(messages):
+        if msg["role"] != "assistant":
+            continue
+        content = msg.get("content") or ""
+        if not content.startswith("<think>\n"):
+            logger.error("no leading <think> block")
+            raise ValueError("no leading <think> block in assistant message")
+        target = content[len("<think>\n"):]
+        if not target.strip():
+            continue
+        context = tokenizer.apply_chat_template(
+            messages[:i], tokenize=False, add_generation_prompt=True, enable_thinking=True
+        )
+        turns.append((context, target, messages[:i + 1]))
+    return turns
 
 
 def _draft_completions(
@@ -234,67 +258,58 @@ class SpeculativeAcceptanceCallback(TrainerCallback):
             if not messages:
                 continue
 
-            prompt      = _prompt_text(messages, self.tokenizer)
-            target_text = _assistant_text(messages)
-            if target_text[:len("<think>\n")] == "<think>\n":
-                target_text = target_text[len("<think>\n"):]
-            else:
-                raise ValueError(f"Failed to find leading <think> block in target text")
+            # convert GLM-style <think> blocks to Qwen3 if needed
+            for m in messages:
+                if m["role"] == "assistant":
+                    m["content"] = _qwen3_convert_glm_think_blocks(m["content"])
 
-            if not target_text.strip():
-                continue
+            for prompt, target_text, turn_messages in _assistant_turns(messages, self.tokenizer):
+                # Parity check: prompt + target_text must be a prefix of the fully-templated turn.
+                full = self.tokenizer.apply_chat_template(turn_messages, tokenize=False)
+                reconstructed = prompt + target_text
+                if not full.startswith(reconstructed):
+                    logger.error("prompt+target is not a prefix of full template")
+                    import pdb; pdb.set_trace()
+                    raise ValueError("Prompt/target reconstruction failed parity check")
 
-            # Parity check: prompt + target_text must be a prefix of the fully-templated conversation.
-            # If it isn't, our prompt construction or target extraction is misaligned with the template.
-            full = self.tokenizer.apply_chat_template(messages, tokenize=False)
-            reconstructed = prompt + target_text
-            if not full.startswith(reconstructed):
-                logger.error(
-                    "prompt+target is not a prefix of full template.\n"
-                    "  reconstructed[:200]: %r\n  full[:200]:          %r",
-                    reconstructed[:200],
-                    full[:200],
-                )
-                raise ValueError("Prompt/target reconstruction failed parity check")
+                accepted_char_pos = 0
+                pbar = tqdm(total=len(target_text), desc="SpecDec acceptance", unit="char", leave=False)
 
-            accepted_char_pos = 0
-            pbar = tqdm(total=len(target_text), desc="SpecDec acceptance", unit="char", leave=False)
+                for _ in range(200):  # hard cap on iterations per turn
+                    remaining = target_text[accepted_char_pos:]
+                    if not remaining.strip():
+                        break
 
-            for _ in range(200):  # hard cap on iterations per sample
-                remaining = target_text[accepted_char_pos:]
-                if not remaining.strip():
-                    break
+                    context = prompt + target_text[:accepted_char_pos]
+                    all_ids = _draft_completions(model, self.tokenizer, context, n, d, cfg.spec_dec_draft_temperature, device)
 
-                context = prompt + target_text[:accepted_char_pos]
-                all_ids = _draft_completions(model, self.tokenizer, context, n, d, cfg.spec_dec_draft_temperature, device)
+                    results   = [_accepted_tokens(ids, remaining, self.tokenizer) for ids in all_ids]
+                    k_values  = [r[0] for r in results]
+                    lcp_chars = [r[1] for r in results]
 
-                results   = [_accepted_tokens(ids, remaining, self.tokenizer) for ids in all_ids]
-                k_values  = [r[0] for r in results]
-                lcp_chars = [r[1] for r in results]
+                    best_k   = max(k_values)
+                    best_idx = k_values.index(best_k)
 
-                best_k   = max(k_values)
-                best_idx = k_values.index(best_k)
+                    for pos in range(d):
+                        pos_avg[pos].append(sum(1 for k in k_values if k > pos) / n)
+                        pos_best[pos].append(1.0 if best_k > pos else 0.0)
 
-                for pos in range(d):
-                    pos_avg[pos].append(sum(1 for k in k_values if k > pos) / n)
-                    pos_best[pos].append(1.0 if best_k > pos else 0.0)
+                    best_lcp = lcp_chars[best_idx]
+                    if best_lcp > 0:
+                        accepted_char_pos += best_lcp
+                        pbar.update(best_lcp)
+                    else:
+                        # Nothing matched — advance by minimum number of draft tokens that will
+                        # get us to next clean utf-8 boundary in decoded text
+                        skip_token_cnt = 0
+                        skip_prefix = ""
+                        remaining_ids = self.tokenizer.encode(remaining[:50])
+                        while skip_token_cnt == 0 or remaining[:len(skip_prefix)] != skip_prefix:
+                            skip_token_cnt += 1
+                            skip_prefix = self.tokenizer.decode(remaining_ids[:skip_token_cnt])
 
-                best_lcp = lcp_chars[best_idx]
-                if best_lcp > 0:
-                    accepted_char_pos += best_lcp
-                    pbar.update(best_lcp)
-                else:
-                    # Nothing matched — advance by minimum number of draft tokens that will
-                    # get us to next clean utf-8 boundary in decoded text
-                    skip_token_cnt = 0
-                    skip_prefix = ""
-                    remaining_ids = self.tokenizer.encode(remaining[:50])
-                    while skip_token_cnt == 0 or remaining[:len(skip_prefix)] != skip_prefix:
-                        skip_token_cnt += 1
-                        skip_prefix = self.tokenizer.decode(remaining_ids[:skip_token_cnt])
-
-                    accepted_char_pos += len(skip_prefix)
-                    pbar.update(len(skip_prefix))
+                        accepted_char_pos += len(skip_prefix)
+                        pbar.update(len(skip_prefix))
 
         out: dict[str, float] = {}
         for pos in range(d):
