@@ -25,6 +25,8 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 import re
+import wandb
+
 
 import torch
 from tqdm.auto import tqdm
@@ -245,6 +247,11 @@ class SpeculativeAcceptanceCallback(TrainerCallback):
         metrics.update(spec_metrics)
         if spec_metrics:
             logger.info("Speculative metrics: %s", spec_metrics)
+            # trainer.log() fires before on_evaluate, so spec metrics miss the wandb payload.
+            # Log them directly at the same step.
+            if "wandb" in (args.report_to or []):
+                if wandb.run is not None:
+                    wandb.log({**spec_metrics, "train/global_step": state.global_step}, step=state.global_step)
 
     def _run(self, model, device) -> dict[str, float]:
         cfg = self.config
