@@ -253,7 +253,9 @@ class SpeculativeAcceptanceCallback(TrainerCallback):
         pos_avg:  list[list[float]] = [[] for _ in range(d)]
         pos_best: list[list[float]] = [[] for _ in range(d)]
 
-        for sample in self.eval_samples:
+        n_samples = len(self.eval_samples)
+
+        for i, sample in enumerate(self.eval_samples):
             messages = sample.get("messages") or sample.get("conversations") or []
             if not messages:
                 continue
@@ -263,17 +265,22 @@ class SpeculativeAcceptanceCallback(TrainerCallback):
                 if m["role"] == "assistant":
                     m["content"] = _qwen3_convert_glm_think_blocks(m["content"])
 
-            for prompt, target_text, turn_messages in _assistant_turns(messages, self.tokenizer):
+            turns = _assistant_turns(messages, self.tokenizer)
+            n_turns = len(turns)
+            total_chars = sum(len(target) for _, target, _ in turns)
+            pbar = tqdm(total=total_chars, desc=f"sample {i + 1}/{n_samples} turn 1/{n_turns}", unit="char", leave=False)
+
+            for j, (prompt, target_text, turn_messages) in enumerate(turns):
                 # Parity check: prompt + target_text must be a prefix of the fully-templated turn.
                 full = self.tokenizer.apply_chat_template(turn_messages, tokenize=False)
                 reconstructed = prompt + target_text
                 if not full.startswith(reconstructed):
                     logger.error("prompt+target is not a prefix of full template")
-                    import pdb; pdb.set_trace()
+                    pbar.close()
                     raise ValueError("Prompt/target reconstruction failed parity check")
 
+                pbar.set_description(f"sample {i + 1}/{n_samples} turn {j + 1}/{n_turns}")
                 accepted_char_pos = 0
-                pbar = tqdm(total=len(target_text), desc="SpecDec acceptance", unit="char", leave=False)
 
                 for _ in range(200):  # hard cap on iterations per turn
                     remaining = target_text[accepted_char_pos:]
@@ -289,6 +296,9 @@ class SpeculativeAcceptanceCallback(TrainerCallback):
 
                     best_k   = max(k_values)
                     best_idx = k_values.index(best_k)
+
+                    # if j == 5:
+                    #     import pdb; pdb.set_trace()
 
                     for pos in range(d):
                         pos_avg[pos].append(sum(1 for k in k_values if k > pos) / n)
@@ -310,6 +320,8 @@ class SpeculativeAcceptanceCallback(TrainerCallback):
 
                         accepted_char_pos += len(skip_prefix)
                         pbar.update(len(skip_prefix))
+
+            pbar.close()
 
         out: dict[str, float] = {}
         for pos in range(d):
