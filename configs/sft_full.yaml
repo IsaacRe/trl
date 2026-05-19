@@ -47,10 +47,22 @@ gradient_checkpointing_kwargs:
 
 # Logging & evaluation
 logging_steps: 10
-eval_strategy: "no"
+eval_strategy: steps
+eval_steps: 500
 save_strategy: steps
 save_steps: 500
 save_total_limit: 3
 
 # Misc
-dataloader_num_workers: 4
+dataloader_num_workers: 1
+
+# Speculative decoding acceptance eval (optional)
+# Uncomment and fill in to enable. Requires eval_strategy != "no" above.
+# spec_dec_endpoint: http://localhost:8080/v1
+# spec_dec_model: GLM-5.1
+# spec_dec_api_key: EMPTY
+# spec_dec_n_drafts: 4
+# spec_dec_d_tokens: 8
+# spec_dec_n_eval_samples: 50
+# spec_dec_max_target_tokens: 512
+# spec_dec_draft_temperature: 1.0

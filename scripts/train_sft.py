@@ -1,11 +1,21 @@
 """
-SFT training wrapper that remaps ShareGPT role names (human→user, gpt→assistant)
-before handing the dataset to TRL's SFTTrainer.
+SFT training wrapper that:
+  - Remaps ShareGPT role names (human→user, gpt→assistant)
+  - Carves a held-out eval set from the training stream for val loss + perplexity
+  - Optionally attaches speculative decoding acceptance eval (see SpecDecConfig)
 
 Usage:
     CUDA_VISIBLE_DEVICES=0 .venv/bin/python scripts/train_sft.py --config configs/sft_full.yaml
     CUDA_VISIBLE_DEVICES=0 .venv/bin/python scripts/train_sft.py --config configs/sft_lora.yaml
 """
+
+import itertools
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(__file__))
+
+from speculative_eval import SpecDecConfig, SpeculativeAcceptanceCallback
 
 _ROLE_MAP = {"human": "user", "gpt": "assistant"}
 
@@ -17,16 +27,19 @@ def remap_roles(example):
     return example
 
 
-def main(script_args, training_args, model_args, dataset_args):
+def main(script_args, training_args, model_args, dataset_args, spec_dec_args):
     from accelerate import logging
-    from datasets import load_dataset
+    from datasets import Dataset, load_dataset
     from transformers import AutoConfig, AutoModelForCausalLM
     from transformers.models.auto.modeling_auto import MODEL_FOR_IMAGE_TEXT_TO_TEXT_MAPPING_NAMES
-
     from trl import SFTTrainer, get_dataset, get_kbit_device_map, get_peft_config, get_quantization_config
+    from trl.data_utils import maybe_convert_to_chatml
 
     logger = logging.get_logger(__name__)
 
+    # ------------------------------------------------------------------
+    # Model
+    # ------------------------------------------------------------------
     model_kwargs = dict(
         revision=model_args.model_revision,
         trust_remote_code=model_args.trust_remote_code,
@@ -48,6 +61,9 @@ def main(script_args, training_args, model_args, dataset_args):
     else:
         model = AutoModelForCausalLM.from_pretrained(model_args.model_name_or_path, **model_kwargs)
 
+    # ------------------------------------------------------------------
+    # Dataset
+    # ------------------------------------------------------------------
     if dataset_args.datasets and script_args.dataset_name:
         logger.warning(
             "Both `datasets` and `dataset_name` are provided. The `datasets` argument will be used to load the "
@@ -66,13 +82,50 @@ def main(script_args, training_args, model_args, dataset_args):
     # Remap ShareGPT role names before TRL processes them
     dataset = dataset.map(remap_roles)
 
+    # ------------------------------------------------------------------
+    # Eval dataset — carved from the head of the training stream.
+    # Used for both standard val loss and speculative acceptance eval.
+    # NOTE: these samples also appear in the training stream; at 1M samples
+    # the overlap is negligible but not zero.
+    # ------------------------------------------------------------------
+    n_eval = spec_dec_args.spec_dec_n_eval_samples
+    raw_eval = [
+        maybe_convert_to_chatml(dict(s))
+        for s in itertools.islice(dataset[script_args.dataset_train_split], n_eval)
+    ]
+    eval_dataset = Dataset.from_list(raw_eval) if training_args.eval_strategy != "no" else None
+
+    # ------------------------------------------------------------------
+    # Speculative acceptance callback (runs whenever eval runs)
+    # ------------------------------------------------------------------
+    from transformers import AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(model_args.model_name_or_path)
+    callbacks = [
+        SpeculativeAcceptanceCallback(
+            config=spec_dec_args,
+            tokenizer=tokenizer,
+            eval_samples=raw_eval,
+        )
+    ]
+
+    # ------------------------------------------------------------------
+    # Trainer
+    # ------------------------------------------------------------------
     trainer = SFTTrainer(
         model=model,
         args=training_args,
         train_dataset=dataset[script_args.dataset_train_split],
-        eval_dataset=dataset[script_args.dataset_test_split] if training_args.eval_strategy != "no" else None,
+        eval_dataset=eval_dataset,
         peft_config=get_peft_config(model_args),
+        callbacks=callbacks if callbacks else None,
     )
+
+    if spec_dec_args.spec_dec_eval_only:
+        metrics = trainer.evaluate()
+        trainer.log_metrics("eval", metrics)
+        trainer.save_metrics("eval", metrics)
+        return
 
     trainer.train()
     trainer.accelerator.print("✅ Training completed.")
@@ -88,6 +141,8 @@ def main(script_args, training_args, model_args, dataset_args):
 if __name__ == "__main__":
     from trl import DatasetMixtureConfig, ModelConfig, ScriptArguments, SFTConfig, TrlParser
 
-    parser = TrlParser((ScriptArguments, SFTConfig, ModelConfig, DatasetMixtureConfig))
-    script_args, training_args, model_args, dataset_args = parser.parse_args_and_config(fail_with_unknown_args=False)
-    main(script_args, training_args, model_args, dataset_args)
+    parser = TrlParser((ScriptArguments, SFTConfig, ModelConfig, DatasetMixtureConfig, SpecDecConfig))
+    script_args, training_args, model_args, dataset_args, spec_dec_args = parser.parse_args_and_config(
+        fail_with_unknown_args=False
+    )
+    main(script_args, training_args, model_args, dataset_args, spec_dec_args)
