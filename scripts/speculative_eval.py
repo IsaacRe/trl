@@ -292,19 +292,19 @@ class SpeculativeAcceptanceCallback(TrainerCallback):
 
                     results   = [_accepted_tokens(ids, remaining, self.tokenizer) for ids in all_ids]
                     k_values  = [r[0] for r in results]
-                    lcp_chars = [r[1] for r in results]
 
                     best_k   = max(k_values)
                     best_idx = k_values.index(best_k)
 
-                    # if j == 5:
+                    # if '**Recommendation:** Please try taking another screenshot of the Docker Hub page and ensure it has fully loaded before capturing it. This will allow me to provide you with a comprehensive description of the navigation, featured content, popular images, categories, and trending items visible on the page.", "screenshot_path": "/home/ubuntu/.hermes/cache/screenshots/browser_screenshot_46257e23f1c44c7a8659f369ca7b0345.png"' in context and context.endswith('<tool_call>'):
                     #     import pdb; pdb.set_trace()
 
                     for pos in range(d):
                         pos_avg[pos].append(sum(1 for k in k_values if k > pos) / n)
                         pos_best[pos].append(1.0 if best_k > pos else 0.0)
 
-                    best_lcp = lcp_chars[best_idx]
+                    # advance to next fully accepted token boundary of best draft proposal
+                    best_lcp = len(self.tokenizer.decode(all_ids[best_idx][:best_k]))
                     if best_lcp > 0:
                         accepted_char_pos += best_lcp
                         pbar.update(best_lcp)
