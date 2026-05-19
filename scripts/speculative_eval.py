@@ -296,9 +296,6 @@ class SpeculativeAcceptanceCallback(TrainerCallback):
                     best_k   = max(k_values)
                     best_idx = k_values.index(best_k)
 
-                    # if '**Recommendation:** Please try taking another screenshot of the Docker Hub page and ensure it has fully loaded before capturing it. This will allow me to provide you with a comprehensive description of the navigation, featured content, popular images, categories, and trending items visible on the page.", "screenshot_path": "/home/ubuntu/.hermes/cache/screenshots/browser_screenshot_46257e23f1c44c7a8659f369ca7b0345.png"' in context and context.endswith('<tool_call>'):
-                    #     import pdb; pdb.set_trace()
-
                     for pos in range(d):
                         pos_avg[pos].append(sum(1 for k in k_values if k > pos) / n)
                         pos_best[pos].append(1.0 if best_k > pos else 0.0)
