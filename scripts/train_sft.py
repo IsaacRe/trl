@@ -13,9 +13,11 @@ import itertools
 import os
 import sys
 
+from transformers import AutoTokenizer
+
 sys.path.insert(0, os.path.dirname(__file__))
 
-from speculative_eval import SpecDecConfig, SpeculativeAcceptanceCallback
+from speculative_eval import SpecDecConfig, SpecDecEvalEntry, SpeculativeAcceptanceCallback
 
 _ROLE_MAP = {"human": "user", "gpt": "assistant"}
 
@@ -25,6 +27,16 @@ def remap_roles(example):
         if isinstance(msg, dict) and msg.get("from") in _ROLE_MAP:
             msg["from"] = _ROLE_MAP[msg["from"]]
     return example
+
+
+def _load_spec_dec_eval(argv: list[str]) -> list[dict]:
+    """Extract the spec_dec_eval list directly from the --config YAML."""
+    import yaml
+    for i, arg in enumerate(argv):
+        if arg == "--config" and i + 1 < len(argv):
+            with open(argv[i + 1]) as f:
+                return yaml.safe_load(f).get("spec_dec_eval", [])
+    return []
 
 
 def _compose_run_name(training_args, model_args) -> str:
@@ -77,6 +89,8 @@ def main(script_args, training_args, model_args, dataset_args, spec_dec_args):
     else:
         model = AutoModelForCausalLM.from_pretrained(model_args.model_name_or_path, **model_kwargs)
 
+    tokenizer = AutoTokenizer.from_pretrained(model_args.model_name_or_path)
+
     # ------------------------------------------------------------------
     # Dataset
     # ------------------------------------------------------------------
@@ -95,40 +109,45 @@ def main(script_args, training_args, model_args, dataset_args, spec_dec_args):
     else:
         raise ValueError("Either `datasets` or `dataset_name` must be provided.")
 
-    # Remap ShareGPT role names before TRL processes them
-    dataset = dataset.map(remap_roles)
+    # Remap ShareGPT role names and convert to ChatML format before TRL processes them
+    dataset = dataset.map(lambda ex: maybe_convert_to_chatml(remap_roles(ex)))
 
     # ------------------------------------------------------------------
-    # Eval dataset — either a separate held-out HF dataset or (fallback)
-    # the first N samples carved from the training stream.
+    # Eval datasets — built from the spec_dec_eval list in the YAML.
+    # Each entry specifies a dataset, sample count, and drafting params.
     # ------------------------------------------------------------------
-    n_eval = spec_dec_args.spec_dec_n_eval_samples
-    if spec_dec_args.spec_dec_eval_dataset:
-        _eval_stream = load_dataset(spec_dec_args.spec_dec_eval_dataset, streaming=True, split="train")
-        raw_eval = [
-            maybe_convert_to_chatml(remap_roles(dict(s)))
-            for s in itertools.islice(_eval_stream, n_eval)
-        ]
-    else:
-        raw_eval = [
-            maybe_convert_to_chatml(dict(s))
-            for s in itertools.islice(dataset[script_args.dataset_train_split], n_eval)
-        ]
-    eval_dataset = Dataset.from_list(raw_eval) if training_args.eval_strategy != "no" else None
 
-    # ------------------------------------------------------------------
-    # Speculative acceptance callback (runs whenever eval runs)
-    # ------------------------------------------------------------------
-    from transformers import AutoTokenizer
+    spec_dec_eval_list = _load_spec_dec_eval(sys.argv)
+    eval_entries: list[SpecDecEvalEntry] = []
+    for entry_cfg in spec_dec_eval_list:
+        dataset_id = entry_cfg["dataset"]
+        n_samples  = entry_cfg.get("n_samples", 10)
+        name       = entry_cfg.get("name") or dataset_id.split("/")[-1].split("-")[0]
 
-    tokenizer = AutoTokenizer.from_pretrained(model_args.model_name_or_path)
-    callbacks = [
-        SpeculativeAcceptanceCallback(
-            config=spec_dec_args,
-            tokenizer=tokenizer,
-            eval_samples=raw_eval,
-        )
-    ]
+        if dataset_id == script_args.dataset_name:
+            raw = [
+                maybe_convert_to_chatml(dict(s))
+                for s in itertools.islice(dataset[script_args.dataset_train_split], n_samples)
+            ]
+        else:
+            _stream = load_dataset(dataset_id, streaming=True, split="train")
+            raw = [
+                maybe_convert_to_chatml(remap_roles(dict(s)))
+                for s in itertools.islice(_stream, n_samples)
+            ]
+
+        eval_entries.append(SpecDecEvalEntry(
+            name=name,
+            n_drafts=entry_cfg.get("n_drafts", 4),
+            d_tokens=entry_cfg.get("d_tokens", 8),
+            temperature=entry_cfg.get("temperature", 1.0),
+            eval_samples=raw,
+        ))
+
+    all_raw_eval = [s for e in eval_entries for s in e.eval_samples]
+    eval_dataset = Dataset.from_list(all_raw_eval) if training_args.eval_strategy != "no" and all_raw_eval else None
+
+    callbacks = [SpeculativeAcceptanceCallback(tokenizer=tokenizer, eval_entries=eval_entries)]
 
     # ------------------------------------------------------------------
     # Trainer

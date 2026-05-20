@@ -40,7 +40,7 @@ gradient_checkpointing_kwargs:
   use_reentrant: false
 
 # Loss — train on assistant tokens only
-assistant_only_loss: true
+# assistant_only_loss: true
 
 # Logging & evaluation
 logging_steps: 1
@@ -54,8 +54,16 @@ save_steps: 200
 dataloader_num_workers: 1
 
 # Speculative decoding acceptance eval
-spec_dec_eval_dataset: Locutusque/hermes-agent-reasoning-traces-glm-5.1-formatted
-spec_dec_n_drafts: 4
-spec_dec_d_tokens: 8
-spec_dec_n_eval_samples: 1
-spec_dec_draft_temperature: 0.8
+spec_dec_eval:
+  - dataset: Locutusque/hermes-agent-reasoning-traces-glm-5.1-formatted
+    name: hermes-agent
+    n_drafts: 4
+    d_tokens: 8
+    n_samples: 1
+    temperature: 0.8
+  - dataset: PhantomG27249/GLM-5.1-Reasoning-1M-Cleaned
+    name: train
+    n_drafts: 4
+    d_tokens: 8
+    n_samples: 5
+    temperature: 0.8
