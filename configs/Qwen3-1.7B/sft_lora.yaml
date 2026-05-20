@@ -1,0 +1,73 @@
+# LoRA fine-tuning: Qwen3-1.7B on PhantomG27249/GLM-5.1-Reasoning-1M-Cleaned
+# Rank-256 LoRA on q_proj, k_proj, v_proj, o_proj only.
+#
+# Run with:
+#   CUDA_VISIBLE_DEVICES=0 .venv/bin/python scripts/train_sft.py --config configs/Qwen3-1.7B/sft_lora.yaml
+
+# Dataset
+dataset_name: PhantomG27249/GLM-5.1-Reasoning-1M-Cleaned
+dataset_config: main
+dataset_train_split: train
+dataset_streaming: true
+
+# Model
+model_name_or_path: Qwen/Qwen3-1.7B
+dtype: bfloat16
+attn_implementation: sdpa
+
+# PEFT / LoRA
+use_peft: true
+lora_r: 256
+lora_alpha: 256
+lora_dropout: 0.05
+lora_target_modules:
+  - q_proj
+  - k_proj
+  - v_proj
+  - o_proj
+
+# Output
+output_dir: ""
+run_name: glm_1shot_sft
+report_to: none
+
+# Training hyperparameters
+# 1M samples / (8 per_device * 4 grad_accum) = 31,250 steps per epoch
+max_steps: 1000
+per_device_train_batch_size: 4
+gradient_accumulation_steps: 8
+learning_rate: 2.0e-4
+lr_scheduler_type: cosine
+warmup_ratio: 0.05
+weight_decay: 0.01
+
+# Sequence length
+max_length: 4096
+packing: false
+
+# Precision & memory
+bf16: true
+gradient_checkpointing: true
+gradient_checkpointing_kwargs:
+  use_reentrant: false
+
+# Loss — train on assistant tokens only
+assistant_only_loss: true
+
+# Logging & evaluation
+logging_steps: 1
+eval_strategy: steps
+eval_steps: 50
+save_strategy: steps
+save_steps: 200
+# save_total_limit: 3
+
+# Misc
+dataloader_num_workers: 1
+
+# Speculative decoding acceptance eval
+spec_dec_eval_dataset: Locutusque/hermes-agent-reasoning-traces-glm-5.1-formatted
+spec_dec_n_drafts: 4
+spec_dec_d_tokens: 8
+spec_dec_n_eval_samples: 1
+spec_dec_draft_temperature: 0.8
