@@ -31,7 +31,8 @@ lora_target_modules:
   - o_proj
 
 # Output
-output_dir: outputs/qwen3.5-2b-sft-lora-r256
+output_dir: ""
+run_name: glm_1shot_sft
 report_to: none
 
 # Training hyperparameters

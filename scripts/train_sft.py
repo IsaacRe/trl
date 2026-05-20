@@ -27,6 +27,18 @@ def remap_roles(example):
     return example
 
 
+def _compose_run_name(training_args, model_args) -> str:
+    model_short = model_args.model_name_or_path.split("/")[-1].replace("-", "_")
+    rank_str = f"r{model_args.lora_r}" if getattr(model_args, "use_peft", False) else "full"
+    import re
+    lr_str = re.sub(r"e([+-])0*(\d)", r"e\1\2", f"{training_args.learning_rate:.0e}")
+    parts = [model_short]
+    if training_args.run_name:
+        parts.append(training_args.run_name)
+    parts += [rank_str, f"lr{lr_str}"]
+    return "-".join(parts)
+
+
 def main(script_args, training_args, model_args, dataset_args, spec_dec_args):
     from accelerate import logging
     from datasets import Dataset, load_dataset
@@ -36,6 +48,10 @@ def main(script_args, training_args, model_args, dataset_args, spec_dec_args):
     from trl.data_utils import maybe_convert_to_chatml
 
     logger = logging.get_logger(__name__)
+
+    training_args.run_name = _compose_run_name(training_args, model_args)
+    if not training_args.output_dir:
+        training_args.output_dir = f"outputs/{training_args.run_name}"
 
     # ------------------------------------------------------------------
     # Model

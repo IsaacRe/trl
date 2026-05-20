@@ -19,7 +19,8 @@ dtype: bfloat16
 attn_implementation: sdpa
 
 # Output
-output_dir: outputs/qwen3.5-2b-sft-full
+output_dir: ""
+run_name: glm_1shot_sft
 report_to: none
 
 # Training hyperparameters
