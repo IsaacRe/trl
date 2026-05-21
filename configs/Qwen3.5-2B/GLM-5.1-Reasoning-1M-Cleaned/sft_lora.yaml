@@ -73,6 +73,7 @@ dataloader_num_workers: 1
 spec_dec_eval:
   - dataset: Locutusque/hermes-agent-reasoning-traces-glm-5.1-formatted
     name: hermes-agent
+    max_characters: 4000
     n_drafts: 4
     d_tokens: 8
     n_samples: 1

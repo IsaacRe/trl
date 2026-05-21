@@ -61,6 +61,7 @@ class SpecDecEvalEntry:
     d_tokens: int
     temperature: float
     eval_samples: list[dict]
+    max_characters: int | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -263,10 +264,18 @@ class SpeculativeAcceptanceCallback(TrainerCallback):
 
             turns = _assistant_turns(messages, self.tokenizer)
             n_turns = len(turns)
-            total_chars = sum(len(target) for _, target, _ in turns)
-            pbar = tqdm(total=total_chars, desc=f"[{entry.name}] sample {i + 1}/{n_samples} turn 1/{n_turns}", unit="char", leave=False)
+            pbar_total = sum(len(target) for _, target, _ in turns)
+            if entry.max_characters is not None:
+                pbar_total = min(pbar_total, entry.max_characters)
+            pbar = tqdm(total=pbar_total, desc=f"[{entry.name}] sample {i + 1}/{n_samples} turn 1/{n_turns}", unit="char", leave=False)
+
+            chars_consumed = 0
+            budget_exhausted = False
 
             for j, (prompt, target_text, turn_messages) in enumerate(turns):
+                if budget_exhausted:
+                    break
+
                 # Parity check: prompt + target_text must be a prefix of the fully-templated turn.
                 full = self.tokenizer.apply_chat_template(turn_messages, tokenize=False)
                 reconstructed = prompt + target_text
@@ -278,9 +287,12 @@ class SpeculativeAcceptanceCallback(TrainerCallback):
                 pbar.set_description(f"[{entry.name}] sample {i + 1}/{n_samples} turn {j + 1}/{n_turns}")
                 accepted_char_pos = 0
 
-                for _ in range(200):  # hard cap on iterations per turn
+                for _ in range(128_000):  # hard cap on iterations per turn
                     remaining = target_text[accepted_char_pos:]
                     if not remaining.strip():
+                        break
+                    if entry.max_characters is not None and chars_consumed >= entry.max_characters:
+                        budget_exhausted = True
                         break
 
                     context = prompt + target_text[:accepted_char_pos]
@@ -300,6 +312,7 @@ class SpeculativeAcceptanceCallback(TrainerCallback):
                     best_lcp = len(self.tokenizer.decode(all_ids[best_idx][:best_k]))
                     if best_lcp > 0:
                         accepted_char_pos += best_lcp
+                        chars_consumed += best_lcp
                         pbar.update(best_lcp)
                     else:
                         # Nothing matched — advance by minimum number of draft tokens that will
@@ -312,6 +325,7 @@ class SpeculativeAcceptanceCallback(TrainerCallback):
                             skip_prefix = self.tokenizer.decode(remaining_ids[:skip_token_cnt])
 
                         accepted_char_pos += len(skip_prefix)
+                        chars_consumed += len(skip_prefix)
                         pbar.update(len(skip_prefix))
 
             pbar.close()

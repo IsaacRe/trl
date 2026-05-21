@@ -57,12 +57,14 @@ dataloader_num_workers: 1
 spec_dec_eval:
   - dataset: data/kimi-k2.6-claude-code-traces.parquet
     name: kimi-cc
+    max_characters: 4000
     n_drafts: 4
     d_tokens: 8
     n_samples: 1
     temperature: 0.8
   - dataset: lambda/hermes-agent-reasoning-traces
     name: train
+    max_characters: 4000
     n_drafts: 4
     d_tokens: 8
     n_samples: 1

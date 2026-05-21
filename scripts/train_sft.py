@@ -148,6 +148,7 @@ def main(script_args, training_args, model_args, dataset_args, spec_dec_args):
             d_tokens=entry_cfg.get("d_tokens", 8),
             temperature=entry_cfg.get("temperature", 1.0),
             eval_samples=raw,
+            max_characters=entry_cfg.get("max_characters"),
         ))
 
     all_raw_eval = [s for e in eval_entries for s in e.eval_samples]
