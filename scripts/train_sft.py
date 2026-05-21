@@ -129,6 +129,12 @@ def main(script_args, training_args, model_args, dataset_args, spec_dec_args):
                 maybe_convert_to_chatml(dict(s))
                 for s in itertools.islice(dataset[script_args.dataset_train_split], n_samples)
             ]
+        elif os.path.exists(dataset_id):
+            _stream = load_dataset("parquet", data_files=dataset_id, streaming=True, split="train")
+            raw = [
+                maybe_convert_to_chatml(remap_roles(dict(s)))
+                for s in itertools.islice(_stream, n_samples)
+            ]
         else:
             _stream = load_dataset(dataset_id, streaming=True, split="train")
             raw = [
