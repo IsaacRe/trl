@@ -93,10 +93,11 @@ def _qwen3_open_think_block(prompt: str) -> str:
     return prompt
 
 
-def _build_sequence_with_labels(messages: list[dict], tokenizer) -> tuple[list[int], list[int]]:
+def _build_sequence_with_labels(messages: list[dict], tokenizer) -> tuple[list[int], list[int], list[bool]]:
     """
-    Tokenize the full conversation and return ``(input_ids, labels)`` where
-    ``labels`` has ``-100`` for all non-assistant token positions.
+    Tokenize the full conversation and return ``(input_ids, labels, think_mask)`` where
+    ``labels`` has ``-100`` for all non-assistant token positions and ``think_mask``
+    is ``True`` for tokens inside ``<think>...</think>`` blocks.
 
     The context boundary for each assistant turn is ``<|im_start|>assistant\\n``
     (add_generation_prompt without enable_thinking), so the opening ``<think>\\n``
@@ -105,10 +106,12 @@ def _build_sequence_with_labels(messages: list[dict], tokenizer) -> tuple[list[i
     full_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
     full_ids = tokenizer.encode(full_text)
     labels = [-100] * len(full_ids)
+    think_mask = [False] * len(full_ids)
 
     for i, msg in enumerate(messages):
         if msg["role"] != "assistant":
             continue
+        content = msg.get("content") or ""
         context_text = tokenizer.apply_chat_template(
             messages[:i], tokenize=False, add_generation_prompt=True
         )
@@ -120,7 +123,27 @@ def _build_sequence_with_labels(messages: list[dict], tokenizer) -> tuple[list[i
         for pos in range(n_context, n_end):
             labels[pos] = full_ids[pos]
 
-    return full_ids, labels
+        m = re.search(r"^<think>.*?</think>\n\n", content, re.DOTALL)
+        if m:
+            n_think_end = min(len(tokenizer.encode(context_text + content[:m.end()])), n_end)
+            for pos in range(n_context, n_think_end):
+                think_mask[pos] = True
+
+    def get_masked():
+        thoughts = []
+        last_tmask = False
+        for id, tmask in zip(full_ids, think_mask):
+            if tmask:
+                if not last_tmask:
+                    thoughts.append([])
+                thoughts[-1].append(id)
+                last_tmask = True
+            else:
+                last_tmask = False
+        for i, thought in enumerate(thoughts):
+            print(f"Thought {i}: {tokenizer.decode(thought)}")
+
+    return full_ids, labels, think_mask
 
 
 def _assistant_turns(messages: list[dict], tokenizer) -> list[tuple[str, str, list[dict]]]:
@@ -293,8 +316,9 @@ class SpeculativeAcceptanceCallback(TrainerCallback):
                     wandb.log({**all_metrics, "train/global_step": state.global_step})
 
     def _run_full_eval(self, model, device, entry: FullEvalEntry) -> dict[str, float]:
-        total_correct = 0
-        total_tokens = 0
+        total_correct = total_tokens = 0
+        think_correct = think_tokens = 0
+        nothink_correct = nothink_tokens = 0
         chunk_size = 2048
 
         for sample in entry.eval_samples:
@@ -305,17 +329,18 @@ class SpeculativeAcceptanceCallback(TrainerCallback):
                 if m["role"] == "assistant":
                     m["content"] = _qwen3_convert_glm_think_blocks(m["content"])
 
-            input_ids, label_ids = _build_sequence_with_labels(messages, self.tokenizer)
+            input_ids, label_ids, think_mask = _build_sequence_with_labels(messages, self.tokenizer)
             if entry.max_length is not None:
-                input_ids = input_ids[:entry.max_length]
-                label_ids = label_ids[:entry.max_length]
+                input_ids  = input_ids[:entry.max_length]
+                label_ids  = label_ids[:entry.max_length]
+                think_mask = think_mask[:entry.max_length]
 
             seq_len = len(input_ids)
-            ids_t = torch.tensor([input_ids], dtype=torch.long, device=device)
-            shift_labels = torch.tensor(label_ids[1:], dtype=torch.long, device=device)
+            ids_t        = torch.tensor([input_ids], dtype=torch.long, device=device)
+            shift_labels = torch.tensor(label_ids[1:],  dtype=torch.long, device=device)
+            shift_think  = torch.tensor(think_mask[1:], dtype=torch.bool, device=device)
 
             past_key_values = None
-            import pdb; pdb.set_trace()
             for chunk_start in range(0, seq_len, chunk_size):
                 chunk_end = min(chunk_start + chunk_size, seq_len)
                 with torch.inference_mode():
@@ -330,25 +355,39 @@ class SpeculativeAcceptanceCallback(TrainerCallback):
                 pred_end = min(chunk_end, seq_len - 1)
                 n_preds = pred_end - chunk_start
                 if n_preds > 0:
-                    preds = out.logits[0, :n_preds].argmax(dim=-1)
-                    lbls = shift_labels[chunk_start:pred_end]
-                    mask = lbls != -100
-                    total_correct += ((preds == lbls) & mask).sum().item()
-                    total_tokens += mask.sum().item()
+                    preds   = out.logits[0, :n_preds].argmax(dim=-1)
+                    lbls    = shift_labels[chunk_start:pred_end]
+                    tmask   = shift_think[chunk_start:pred_end]
+                    lbl_mask = lbls != -100
+                    correct  = (preds == lbls) & lbl_mask
+
+                    total_correct   += correct.sum().item()
+                    total_tokens    += lbl_mask.sum().item()
+                    think_correct   += (correct &  tmask).sum().item()
+                    think_tokens    += (lbl_mask &  tmask).sum().item()
+                    nothink_correct += (correct & ~tmask).sum().item()
+                    nothink_tokens  += (lbl_mask & ~tmask).sum().item()
                 del out
 
         if total_tokens == 0:
             return {}
 
-        return {
-            f"full_eval/{entry.name}/mean_token_accuracy": total_correct / total_tokens,
-        }
+        out = {f"full_eval/{entry.name}/mean_token_accuracy": total_correct / total_tokens}
+        if think_tokens > 0:
+            out[f"full_eval/{entry.name}/mean_token_accuracy_think"]   = think_correct / think_tokens
+        if nothink_tokens > 0:
+            out[f"full_eval/{entry.name}/mean_token_accuracy_nothink"] = nothink_correct / nothink_tokens
+        return out
 
     def _run(self, model, device, entry: SpecDecEvalEntry) -> dict[str, float]:
         d, n = entry.d_tokens, entry.n_drafts
 
-        pos_avg:  list[list[float]] = [[] for _ in range(d)]
-        pos_best: list[list[float]] = [[] for _ in range(d)]
+        pos_avg:          list[list[float]] = [[] for _ in range(d)]
+        pos_best:         list[list[float]] = [[] for _ in range(d)]
+        think_pos_avg:    list[list[float]] = [[] for _ in range(d)]
+        think_pos_best:   list[list[float]] = [[] for _ in range(d)]
+        nothink_pos_avg:  list[list[float]] = [[] for _ in range(d)]
+        nothink_pos_best: list[list[float]] = [[] for _ in range(d)]
 
         n_samples = len(entry.eval_samples)
 
@@ -378,7 +417,6 @@ class SpeculativeAcceptanceCallback(TrainerCallback):
 
                 # Parity check: prompt + target_text must be a prefix of the fully-templated turn.
                 full = self.tokenizer.apply_chat_template(turn_messages, tokenize=False)
-                import pdb; pdb.set_trace()
                 reconstructed = prompt + target_text
                 if not full.startswith(reconstructed):
                     logger.error("prompt+target is not a prefix of full template")
@@ -388,6 +426,12 @@ class SpeculativeAcceptanceCallback(TrainerCallback):
                 pbar.set_description(f"[{entry.name}] sample {i + 1}/{n_samples} turn {j + 1}/{n_turns}")
                 accepted_char_pos = 0
 
+                _think_sentinel = "</think>\n\n"
+                think_end_idx = (
+                    target_text.index(_think_sentinel) + len(_think_sentinel)
+                    if _think_sentinel in target_text else 0
+                )
+
                 for _ in range(128_000):  # hard cap on iterations per turn
                     remaining = target_text[accepted_char_pos:]
                     if not remaining.strip():
@@ -395,6 +439,8 @@ class SpeculativeAcceptanceCallback(TrainerCallback):
                     if entry.max_characters is not None and chars_consumed >= entry.max_characters:
                         budget_exhausted = True
                         break
+
+                    in_think = accepted_char_pos < think_end_idx
 
                     context = prompt + target_text[:accepted_char_pos]
                     all_ids = _draft_completions(model, self.tokenizer, context, n, d, entry.temperature, device)
@@ -406,8 +452,16 @@ class SpeculativeAcceptanceCallback(TrainerCallback):
                     best_idx = k_values.index(best_k)
 
                     for pos in range(d):
-                        pos_avg[pos].append(sum(1 for k in k_values if k > pos) / n)
-                        pos_best[pos].append(1.0 if best_k > pos else 0.0)
+                        avg_val  = sum(1 for k in k_values if k > pos) / n
+                        best_val = 1.0 if best_k > pos else 0.0
+                        pos_avg[pos].append(avg_val)
+                        pos_best[pos].append(best_val)
+                        if in_think:
+                            think_pos_avg[pos].append(avg_val)
+                            think_pos_best[pos].append(best_val)
+                        else:
+                            nothink_pos_avg[pos].append(avg_val)
+                            nothink_pos_best[pos].append(best_val)
 
                     # advance to next fully accepted token boundary of best draft proposal
                     best_lcp = len(self.tokenizer.decode(all_ids[best_idx][:best_k]))
@@ -436,4 +490,10 @@ class SpeculativeAcceptanceCallback(TrainerCallback):
             if pos_avg[pos]:
                 out[f"spec_acc/{entry.name}/avg@{n}_pos{pos + 1}"]  = sum(pos_avg[pos])  / len(pos_avg[pos])
                 out[f"spec_acc/{entry.name}/best@{n}_pos{pos + 1}"] = sum(pos_best[pos]) / len(pos_best[pos])
+            if think_pos_avg[pos]:
+                out[f"spec_acc/{entry.name}/avg@{n}_pos{pos + 1}_think"]  = sum(think_pos_avg[pos])  / len(think_pos_avg[pos])
+                out[f"spec_acc/{entry.name}/best@{n}_pos{pos + 1}_think"] = sum(think_pos_best[pos]) / len(think_pos_best[pos])
+            if nothink_pos_avg[pos]:
+                out[f"spec_acc/{entry.name}/avg@{n}_pos{pos + 1}_nothink"]  = sum(nothink_pos_avg[pos])  / len(nothink_pos_avg[pos])
+                out[f"spec_acc/{entry.name}/best@{n}_pos{pos + 1}_nothink"] = sum(nothink_pos_best[pos]) / len(nothink_pos_best[pos])
         return out

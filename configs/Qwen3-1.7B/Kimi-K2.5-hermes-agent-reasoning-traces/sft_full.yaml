@@ -59,19 +59,26 @@ full_eval:
     - dataset: data/kimi-k2.6-claude-code-traces.parquet
       name: claude-code
       n_samples: 1
-      max_turns: 1
+      max_length:
     - dataset: data/kimi-k2.6-agent.parquet
       name: codex
-      n_samples: 5
+      n_samples: 1
       max_length:
 
-spec_dec_eval:
-  eval_steps: 1
-  datasets:
-    - dataset: data/kimi-k2.6-claude-code-traces.parquet
-      name: reasoning
-      n_drafts: 4
-      n_samples: 1
-      d_tokens: 8
-      max_characters: 2488
-      temperature: 0.6
+# spec_dec_eval:
+#   eval_steps: 1
+#   datasets:
+#     - dataset: data/kimi-k2.6-claude-code-traces.parquet
+#       name: claude-code
+#       n_drafts: 4
+#       n_samples: 1
+#       d_tokens: 16
+#       max_characters: 6000
+#       temperature: 0.6
+#     - dataset: data/kimi-k2.6-agent.parquet
+#       name: codex
+#       n_drafts: 4
+#       n_samples: 1
+#       d_tokens: 16
+#       max_characters: 6000
+#       temperature: 0.6
