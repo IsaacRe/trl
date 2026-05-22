@@ -1,0 +1,55 @@
+# Verify equivalence between full_eval token accuracy and spec_dec acceptance@pos1.
+# With n_drafts=1, d_tokens=1, temperature=0 (greedy), acceptance@pos1 should
+# closely match mean_token_accuracy since both reduce to: did the argmax == label?
+#
+# Run with:
+#   CUDA_VISIBLE_DEVICES=0 .venv/bin/python scripts/train_sft.py \
+#     --config configs/debug/eval_equivalence.yaml --max_steps 1
+
+dataset_name: lambda/hermes-agent-reasoning-traces
+dataset_config: kimi
+dataset_train_split: train
+dataset_streaming: true
+
+model_name_or_path: Qwen/Qwen3-1.7B
+dtype: bfloat16
+attn_implementation: sdpa
+
+output_dir: outputs/debug_eval_equivalence
+run_name: debug_eval_equivalence
+report_to: none
+
+max_steps: 1
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 1
+learning_rate: 1.0e-5
+lr_scheduler_type: cosine
+
+max_length: 4096
+packing: false
+
+bf16: true
+gradient_checkpointing: false
+
+logging_steps: 1
+eval_strategy: "no"
+save_strategy: "no"
+
+dataloader_num_workers: 1
+
+full_eval:
+  eval_steps: 1
+  datasets:
+    - dataset: lambda/hermes-agent-reasoning-traces
+      name: train
+      n_samples: 3
+
+spec_dec_eval:
+  eval_steps: 1
+  datasets:
+    - dataset: lambda/hermes-agent-reasoning-traces
+      name: train
+      n_drafts: 1
+      d_tokens: 1
+      temperature: 0.0
+      n_samples: 3

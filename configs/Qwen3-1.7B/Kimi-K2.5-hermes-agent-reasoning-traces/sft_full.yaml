@@ -44,8 +44,7 @@ gradient_checkpointing_kwargs:
 
 # Logging & evaluation
 logging_steps: 1
-eval_strategy: steps
-eval_steps: 50
+eval_strategy: "no"
 save_strategy: steps
 save_steps: 200
 # save_total_limit: 3
@@ -53,19 +52,26 @@ save_steps: 200
 # Misc
 dataloader_num_workers: 1
 
-# Speculative decoding acceptance eval
+# Full forward-pass eval (loss, token accuracy, entropy)
+full_eval:
+  eval_steps: 1
+  datasets:
+    - dataset: data/kimi-k2.6-claude-code-traces.parquet
+      name: claude-code
+      n_samples: 1
+      max_turns: 1
+    - dataset: data/kimi-k2.6-agent.parquet
+      name: codex
+      n_samples: 5
+      max_length:
+
 spec_dec_eval:
-  - dataset: data/kimi-k2.6-claude-code-traces.parquet
-    name: kimi-cc
-    max_characters: 4000
-    n_drafts: 4
-    d_tokens: 8
-    n_samples: 1
-    temperature: 0.8
-  - dataset: lambda/hermes-agent-reasoning-traces
-    name: train
-    max_characters: 4000
-    n_drafts: 4
-    d_tokens: 8
-    n_samples: 1
-    temperature: 0.8
+  eval_steps: 1
+  datasets:
+    - dataset: data/kimi-k2.6-claude-code-traces.parquet
+      name: reasoning
+      n_drafts: 4
+      n_samples: 1
+      d_tokens: 8
+      max_characters: 2488
+      temperature: 0.6

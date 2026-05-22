@@ -9,6 +9,7 @@ Usage:
     CUDA_VISIBLE_DEVICES=0 .venv/bin/python scripts/train_sft.py --config configs/sft_lora.yaml
 """
 
+import dataclasses
 import itertools
 import os
 import sys
@@ -17,9 +18,35 @@ from transformers import AutoTokenizer
 
 sys.path.insert(0, os.path.dirname(__file__))
 
-from speculative_eval import SpecDecConfig, SpecDecEvalEntry, SpeculativeAcceptanceCallback
+from speculative_eval import FullEvalEntry, SpecDecConfig, SpecDecEvalEntry, SpeculativeAcceptanceCallback
 
 _ROLE_MAP = {"human": "user", "gpt": "assistant"}
+
+
+@dataclasses.dataclass
+class BaseEvalConfig:
+    dataset: str
+    name: str = ""
+    n_samples: int = 10
+    max_turns: int | None = None
+    eval_steps: int | None = None
+
+    def __post_init__(self):
+        if not self.name:
+            self.name = self.dataset.split("/")[-1].split("-")[0]
+
+
+@dataclasses.dataclass
+class SpecDecEvalConfig(BaseEvalConfig):
+    n_drafts: int = 1
+    d_tokens: int = 8
+    temperature: float = 0.8
+    max_characters: int | None = None
+
+
+@dataclasses.dataclass
+class FullEvalConfig(BaseEvalConfig):
+    max_length: int | None = None
 
 
 def remap_roles(example):
@@ -29,13 +56,17 @@ def remap_roles(example):
     return example
 
 
-def _load_spec_dec_eval(argv: list[str]) -> list[dict]:
-    """Extract the spec_dec_eval list directly from the --config YAML."""
+def _load_yaml_eval_section(argv: list[str], key: str, cls: type) -> list:
+    """Load a full_eval/spec_dec_eval section as typed config objects."""
     import yaml
     for i, arg in enumerate(argv):
         if arg == "--config" and i + 1 < len(argv):
             with open(argv[i + 1]) as f:
-                return yaml.safe_load(f).get("spec_dec_eval", [])
+                section = yaml.safe_load(f).get(key) or {}
+            if isinstance(section, dict):
+                eval_steps = section.get("eval_steps")
+                return [cls(**{**e, "eval_steps": eval_steps}) for e in section.get("datasets", [])]
+            return [cls(**e) for e in section]
     return []
 
 
@@ -53,7 +84,7 @@ def _compose_run_name(training_args, model_args) -> str:
 
 def main(script_args, training_args, model_args, dataset_args, spec_dec_args):
     from accelerate import logging
-    from datasets import Dataset, load_dataset
+    from datasets import load_dataset
     from transformers import AutoConfig, AutoModelForCausalLM
     from transformers.models.auto.modeling_auto import MODEL_FOR_IMAGE_TEXT_TO_TEXT_MAPPING_NAMES
     from trl import SFTTrainer, get_dataset, get_kbit_device_map, get_peft_config, get_quantization_config
@@ -117,44 +148,62 @@ def main(script_args, training_args, model_args, dataset_args, spec_dec_args):
     # Each entry specifies a dataset, sample count, and drafting params.
     # ------------------------------------------------------------------
 
-    spec_dec_eval_list = _load_spec_dec_eval(sys.argv)
-    eval_entries: list[SpecDecEvalEntry] = []
-    for entry_cfg in spec_dec_eval_list:
-        dataset_id = entry_cfg["dataset"]
-        n_samples  = entry_cfg.get("n_samples", 10)
-        name       = entry_cfg.get("name") or dataset_id.split("/")[-1].split("-")[0]
-
-        if dataset_id == script_args.dataset_name:
-            raw = [
-                maybe_convert_to_chatml(dict(s))
-                for s in itertools.islice(dataset[script_args.dataset_train_split], n_samples)
-            ]
-        elif os.path.exists(dataset_id):
-            _stream = load_dataset("parquet", data_files=dataset_id, streaming=True, split="train")
+    def _load_samples(cfg: SpecDecEvalConfig | FullEvalConfig) -> list[dict]:
+        if cfg.dataset == script_args.dataset_name:
             raw = [
                 maybe_convert_to_chatml(remap_roles(dict(s)))
-                for s in itertools.islice(_stream, n_samples)
+                for s in itertools.islice(dataset[script_args.dataset_train_split], cfg.n_samples)
+            ]
+        elif os.path.exists(cfg.dataset):
+            _stream = load_dataset("parquet", data_files=cfg.dataset, streaming=True, split="train")
+            raw = [
+                maybe_convert_to_chatml(remap_roles(dict(s)))
+                for s in itertools.islice(_stream, cfg.n_samples)
             ]
         else:
-            _stream = load_dataset(dataset_id, streaming=True, split="train")
+            _stream = load_dataset(cfg.dataset, streaming=True, split="train")
             raw = [
                 maybe_convert_to_chatml(remap_roles(dict(s)))
-                for s in itertools.islice(_stream, n_samples)
+                for s in itertools.islice(_stream, cfg.n_samples)
             ]
+        if cfg.max_turns is not None:
+            for s in raw:
+                msgs = s.get("messages") or s.get("conversations") or []
+                count = 0
+                for idx, m in enumerate(msgs):
+                    if m.get("role") == "assistant":
+                        count += 1
+                        if count == cfg.max_turns:
+                            del msgs[idx + 1:]
+                            break
+        return raw
 
+    eval_entries: list[SpecDecEvalEntry] = []
+    for cfg in _load_yaml_eval_section(sys.argv, "spec_dec_eval", SpecDecEvalConfig):
         eval_entries.append(SpecDecEvalEntry(
-            name=name,
-            n_drafts=entry_cfg.get("n_drafts", 4),
-            d_tokens=entry_cfg.get("d_tokens", 8),
-            temperature=entry_cfg.get("temperature", 1.0),
-            eval_samples=raw,
-            max_characters=entry_cfg.get("max_characters"),
+            name=cfg.name,
+            eval_steps=cfg.eval_steps,
+            eval_samples=_load_samples(cfg),
+            n_drafts=cfg.n_drafts,
+            d_tokens=cfg.d_tokens,
+            temperature=cfg.temperature,
+            max_characters=cfg.max_characters,
         ))
 
-    all_raw_eval = [s for e in eval_entries for s in e.eval_samples]
-    eval_dataset = Dataset.from_list(all_raw_eval) if training_args.eval_strategy != "no" and all_raw_eval else None
+    full_eval_entries: list[FullEvalEntry] = []
+    for cfg in _load_yaml_eval_section(sys.argv, "full_eval", FullEvalConfig):
+        full_eval_entries.append(FullEvalEntry(
+            name=cfg.name,
+            eval_steps=cfg.eval_steps,
+            eval_samples=_load_samples(cfg),
+            max_length=cfg.max_length,
+        ))
 
-    callbacks = [SpeculativeAcceptanceCallback(tokenizer=tokenizer, eval_entries=eval_entries)]
+    callbacks = [SpeculativeAcceptanceCallback(
+        tokenizer=tokenizer,
+        eval_entries=eval_entries,
+        full_eval_entries=full_eval_entries,
+    )]
 
     # ------------------------------------------------------------------
     # Trainer
@@ -163,7 +212,6 @@ def main(script_args, training_args, model_args, dataset_args, spec_dec_args):
         model=model,
         args=training_args,
         train_dataset=dataset[script_args.dataset_train_split],
-        eval_dataset=eval_dataset,
         peft_config=get_peft_config(model_args),
         callbacks=callbacks if callbacks else None,
     )

@@ -27,7 +27,6 @@ from dataclasses import dataclass, field
 import re
 import wandb
 
-
 import torch
 from tqdm.auto import tqdm
 from transformers import TrainerCallback, TrainerControl, TrainerState, TrainingArguments
@@ -57,11 +56,22 @@ class SpecDecEvalEntry:
     """One eval dataset with its own drafting hyperparameters."""
 
     name: str
-    n_drafts: int
-    d_tokens: int
-    temperature: float
     eval_samples: list[dict]
+    eval_steps: int | None = None
+    n_drafts: int = 1
+    d_tokens: int = 8
+    temperature: float = 0.8
     max_characters: int | None = None
+
+
+@dataclass
+class FullEvalEntry:
+    """One eval dataset for full forward-pass metric collection."""
+
+    name: str
+    eval_samples: list[dict]
+    eval_steps: int | None = None
+    max_length: int | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -81,6 +91,36 @@ def _qwen3_open_think_block(prompt: str) -> str:
     if prompt.endswith("<|im_start|>assistant\n"):
         return prompt + "<think>\n"
     return prompt
+
+
+def _build_sequence_with_labels(messages: list[dict], tokenizer) -> tuple[list[int], list[int]]:
+    """
+    Tokenize the full conversation and return ``(input_ids, labels)`` where
+    ``labels`` has ``-100`` for all non-assistant token positions.
+
+    The context boundary for each assistant turn is ``<|im_start|>assistant\\n``
+    (add_generation_prompt without enable_thinking), so the opening ``<think>\\n``
+    token is included in the prediction target.
+    """
+    full_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
+    full_ids = tokenizer.encode(full_text)
+    labels = [-100] * len(full_ids)
+
+    for i, msg in enumerate(messages):
+        if msg["role"] != "assistant":
+            continue
+        context_text = tokenizer.apply_chat_template(
+            messages[:i], tokenize=False, add_generation_prompt=True
+        )
+        turn_end_text = tokenizer.apply_chat_template(
+            messages[:i + 1], tokenize=False, add_generation_prompt=False
+        )
+        n_context = len(tokenizer.encode(context_text))
+        n_end = min(len(tokenizer.encode(turn_end_text)), len(full_ids))
+        for pos in range(n_context, n_end):
+            labels[pos] = full_ids[pos]
+
+    return full_ids, labels
 
 
 def _assistant_turns(messages: list[dict], tokenizer) -> list[tuple[str, str, list[dict]]]:
@@ -197,52 +237,112 @@ class SpeculativeAcceptanceCallback(TrainerCallback):
             each carrying its own samples and drafting hyperparameters.
     """
 
-    def __init__(self, tokenizer, eval_entries: list[SpecDecEvalEntry]):
+    def __init__(self, tokenizer, eval_entries: list[SpecDecEvalEntry], full_eval_entries: list[FullEvalEntry]):
         self.tokenizer = tokenizer
         self.eval_entries = eval_entries
+        self.full_eval_entries = full_eval_entries
 
-    def on_evaluate(
+    def on_step_end(
         self,
         args: TrainingArguments,
         state: TrainerState,
         control: TrainerControl,
         model,
-        metrics: dict,
         **kwargs,
     ):
-        if not self.eval_entries:
+        if state.global_step == 0:
+            return
+        full_eval_entries = [
+            e for e in self.full_eval_entries
+            if e.eval_samples and e.eval_steps and state.global_step % e.eval_steps == 0
+        ]
+        spec_dec_entries = [
+            e for e in self.eval_entries
+            if e.eval_samples and e.eval_steps and state.global_step % e.eval_steps == 0
+        ]
+        if not full_eval_entries and not spec_dec_entries:
             return
 
         was_training = model.training
         model.eval()
         device = next(model.parameters()).device
 
-        all_spec_metrics: dict[str, float] = {}
+        all_metrics: dict[str, float] = {}
         try:
-            for entry in self.eval_entries:
-                if not entry.eval_samples:
-                    continue
-                logger.info(
-                    "Running speculative eval on %d samples [%s]…",
-                    len(entry.eval_samples), entry.name,
-                )
+            for entry in full_eval_entries:
+                logger.warning("Running full eval on %d samples [%s]…", len(entry.eval_samples), entry.name)
                 try:
-                    entry_metrics = self._run(model, device, entry)
+                    all_metrics.update(self._run_full_eval(model, device, entry))
                 except Exception:
-                    logger.exception("Speculative eval failed for entry %s", entry.name)
-                    entry_metrics = {}
-                all_spec_metrics.update(entry_metrics)
+                    logger.exception("Full eval failed for entry %s", entry.name)
+            for entry in spec_dec_entries:
+                logger.warning("Running spec dec eval on %d samples [%s]…", len(entry.eval_samples), entry.name)
+                try:
+                    all_metrics.update(self._run(model, device, entry))
+                except Exception:
+                    logger.exception("Spec dec eval failed for entry %s", entry.name)
         finally:
             if was_training:
                 model.train()
             torch.cuda.empty_cache()
 
-        metrics.update(all_spec_metrics)
-        if all_spec_metrics:
-            logger.info("Speculative metrics: %s", all_spec_metrics)
+        if all_metrics:
+            logger.warning("Full eval metrics: %s", all_metrics)
             if "wandb" in (args.report_to or []):
                 if wandb.run is not None:
-                    wandb.log({**all_spec_metrics, "train/global_step": state.global_step})
+                    wandb.log({**all_metrics, "train/global_step": state.global_step})
+
+    def _run_full_eval(self, model, device, entry: FullEvalEntry) -> dict[str, float]:
+        total_correct = 0
+        total_tokens = 0
+        chunk_size = 2048
+
+        for sample in entry.eval_samples:
+            messages = sample.get("messages") or sample.get("conversations") or []
+            if not messages:
+                continue
+            for m in messages:
+                if m["role"] == "assistant":
+                    m["content"] = _qwen3_convert_glm_think_blocks(m["content"])
+
+            input_ids, label_ids = _build_sequence_with_labels(messages, self.tokenizer)
+            if entry.max_length is not None:
+                input_ids = input_ids[:entry.max_length]
+                label_ids = label_ids[:entry.max_length]
+
+            seq_len = len(input_ids)
+            ids_t = torch.tensor([input_ids], dtype=torch.long, device=device)
+            shift_labels = torch.tensor(label_ids[1:], dtype=torch.long, device=device)
+
+            past_key_values = None
+            import pdb; pdb.set_trace()
+            for chunk_start in range(0, seq_len, chunk_size):
+                chunk_end = min(chunk_start + chunk_size, seq_len)
+                with torch.inference_mode():
+                    out = model(
+                        input_ids=ids_t[:, chunk_start:chunk_end],
+                        past_key_values=past_key_values,
+                        use_cache=True,
+                    )
+                past_key_values = out.past_key_values
+
+                # logits[j] predicts position chunk_start+j+1; last token predicts past end
+                pred_end = min(chunk_end, seq_len - 1)
+                n_preds = pred_end - chunk_start
+                if n_preds > 0:
+                    preds = out.logits[0, :n_preds].argmax(dim=-1)
+                    lbls = shift_labels[chunk_start:pred_end]
+                    mask = lbls != -100
+                    total_correct += ((preds == lbls) & mask).sum().item()
+                    total_tokens += mask.sum().item()
+                del out
+
+        if total_tokens == 0:
+            return {}
+
+        return {
+            f"full_eval/{entry.name}/mean_token_accuracy": total_correct / total_tokens,
+        }
 
     def _run(self, model, device, entry: SpecDecEvalEntry) -> dict[str, float]:
         d, n = entry.d_tokens, entry.n_drafts
@@ -278,6 +378,7 @@ class SpeculativeAcceptanceCallback(TrainerCallback):
 
                 # Parity check: prompt + target_text must be a prefix of the fully-templated turn.
                 full = self.tokenizer.apply_chat_template(turn_messages, tokenize=False)
+                import pdb; pdb.set_trace()
                 reconstructed = prompt + target_text
                 if not full.startswith(reconstructed):
                     logger.error("prompt+target is not a prefix of full template")
