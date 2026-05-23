@@ -34,15 +34,15 @@ report_to: none
 
 # Training hyperparameters
 max_steps: 1000
-per_device_train_batch_size: 4
-gradient_accumulation_steps: 8
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 32
 learning_rate: 2.0e-4
 lr_scheduler_type: cosine
 warmup_ratio: 0.05
 weight_decay: 0.01
 
 # Sequence length
-max_length: 4096
+max_length: 32_000
 packing: false
 
 # Precision & memory
@@ -51,8 +51,14 @@ gradient_checkpointing: true
 gradient_checkpointing_kwargs:
   use_reentrant: false
 
-# Loss — train on assistant tokens only
-# assistant_only_loss: true
+# Loss mode — pick ONE:
+#   assistant_only_loss: true   trains on ALL assistant turns (intermediate turns
+#                               have reasoning stripped by the Qwen3 template;
+#                               final turn retains its <think> block)
+#   completion_only_loss: true   trains ONLY on the sampled final assistant turn
+#                               (with reasoning); uses prompt-completion format
+assistant_only_loss: true
+# completion_only_loss: true
 
 # Logging & evaluation
 logging_steps: 1
@@ -66,14 +72,33 @@ dataloader_num_workers: 1
 
 # Full forward-pass eval (loss, token accuracy, entropy)
 full_eval:
-  eval_steps: 50
+  eval_steps: 10
   datasets:
     - dataset: data/kimi-k2.6-claude-code-traces.parquet
-      name: kimi-cc
-      max_turns: 4
+      name: claude-code
+      n_samples: 3
+      max_turns: 10
+      max_length:
+    - dataset: data/kimi-k2.6-agent.parquet
+      name: codex
+      n_samples: 3
+      max_turns: 10
+      max_length:
+
+spec_dec_eval:
+  eval_steps: 200
+  datasets:
+    - dataset: data/kimi-k2.6-claude-code-traces.parquet
+      name: claude-code
+      n_drafts: 4
       n_samples: 1
-      max_length:
-    - dataset: lambda/hermes-agent-reasoning-traces
-      name: train
-      n_samples: 5
-      max_length:
+      d_tokens: 16
+      max_characters: 8000
+      temperature: 0.6
+    - dataset: data/kimi-k2.6-agent.parquet
+      name: codex
+      n_drafts: 4
+      n_samples: 1
+      d_tokens: 16
+      max_characters: 8000
+      temperature: 0.6

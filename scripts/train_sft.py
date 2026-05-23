@@ -11,7 +11,10 @@ Usage:
 
 import dataclasses
 import itertools
+import logging
 import os
+import random
+import re
 import sys
 
 from transformers import AutoTokenizer
@@ -19,6 +22,8 @@ from transformers import AutoTokenizer
 sys.path.insert(0, os.path.dirname(__file__))
 
 from speculative_eval import FullEvalEntry, SpecDecConfig, SpecDecEvalEntry, SpeculativeAcceptanceCallback
+
+logger = logging.getLogger(__name__)
 
 _ROLE_MAP = {"human": "user", "gpt": "assistant"}
 
@@ -70,10 +75,51 @@ def _load_yaml_eval_section(argv: list[str], key: str, cls: type) -> list:
     return []
 
 
+
+def _make_turn_sampler(seed: int):
+    """Return a dataset map function that randomly selects one assistant turn as the
+    final turn and drops all subsequent messages.
+
+    The RNG is seeded with ``seed`` (typically ``training_args.seed``) so runs are
+    reproducible. For streaming datasets the map is applied lazily and sequentially,
+    so the RNG advances in sample order.
+    """
+    rng = random.Random(seed)
+
+    def _sample(example):
+        msgs = example.get("messages") or []
+        asst_indices = [i for i, m in enumerate(msgs) if m.get("role") == "assistant"]
+        if not asst_indices:
+            return example
+        chosen_msg_idx = rng.choice(asst_indices)
+        return {**example, "messages": list(msgs[:chosen_msg_idx + 1])}
+
+    return _sample
+
+
+
+def _to_prompt_completion(example, tokenizer) -> dict:
+    """Convert the last assistant turn to prompt-completion format.
+
+    ``prompt``     = full context ending with the generation prompt
+                     (all prior turns with reasoning stripped by the template)
+    ``completion`` = the last assistant turn's formatted text
+                     (including ``<think>`` block and ``<|im_end|>`` suffix)
+
+    When the dataset sample has these keys, ``SFTTrainer`` auto-sets
+    ``completion_only_loss=True`` and computes loss only on the completion tokens.
+    """
+    msgs = example.get("messages") or []
+    if not msgs or msgs[-1].get("role") != "assistant":
+        return example
+    full_text   = tokenizer.apply_chat_template(msgs,      tokenize=False, add_generation_prompt=False)
+    prompt_text = tokenizer.apply_chat_template(msgs[:-1], tokenize=False, add_generation_prompt=True)
+    return {**example, "prompt": prompt_text, "completion": full_text[len(prompt_text):]}
+
+
 def _compose_run_name(training_args, model_args) -> str:
     model_short = model_args.model_name_or_path.split("/")[-1].replace("-", "_")
     rank_str = f"r{model_args.lora_r}" if getattr(model_args, "use_peft", False) else "full"
-    import re
     lr_str = re.sub(r"e([+-])0*(\d)", r"e\1\2", f"{training_args.learning_rate:.0e}")
     parts = [model_short]
     if training_args.run_name:
@@ -206,12 +252,32 @@ def main(script_args, training_args, model_args, dataset_args, spec_dec_args):
     )]
 
     # ------------------------------------------------------------------
+    # Training dataset — turn sampling + optional prompt-completion conversion
+    #
+    # Two loss modes (set in YAML):
+    #   assistant_only_loss: true    → conversational format, loss on ALL assistant
+    #                                   turns (intermediate turns have reasoning
+    #                                   stripped by the chat template; final turn
+    #                                   retains its <think> block)
+    #   completion_only_loss: true   → prompt-completion format, loss ONLY on the
+    #                                   selected final assistant turn (with reasoning)
+    #
+    # In both modes the turn sampler randomly selects which assistant turn is
+    # treated as the final one, dropping all subsequent messages.
+    # ------------------------------------------------------------------
+    train_dataset = dataset[script_args.dataset_train_split]
+    train_dataset = train_dataset.map(_make_turn_sampler(training_args.seed))
+
+    if training_args.completion_only_loss is True:
+        train_dataset = train_dataset.map(lambda ex: _to_prompt_completion(ex, tokenizer))
+
+    # ------------------------------------------------------------------
     # Trainer
     # ------------------------------------------------------------------
     trainer = SFTTrainer(
         model=model,
         args=training_args,
-        train_dataset=dataset[script_args.dataset_train_split],
+        train_dataset=train_dataset,
         peft_config=get_peft_config(model_args),
         callbacks=callbacks if callbacks else None,
     )

@@ -39,8 +39,14 @@ gradient_checkpointing: true
 gradient_checkpointing_kwargs:
   use_reentrant: false
 
-# Loss — train on assistant tokens only
-# assistant_only_loss: true
+# Loss mode — pick ONE:
+#   assistant_only_loss: true   trains on ALL assistant turns (intermediate turns
+#                               have reasoning stripped by the Qwen3 template;
+#                               final turn retains its <think> block)
+#   completion_only_loss: true   trains ONLY on the sampled final assistant turn
+#                               (with reasoning); uses prompt-completion format
+assistant_only_loss: true
+# completion_only_loss: true
 
 # Logging & evaluation
 logging_steps: 1

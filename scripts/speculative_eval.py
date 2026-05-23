@@ -95,53 +95,43 @@ def _qwen3_open_think_block(prompt: str) -> str:
 
 def _build_sequence_with_labels(messages: list[dict], tokenizer) -> tuple[list[int], list[int], list[bool]]:
     """
-    Tokenize the full conversation and return ``(input_ids, labels, think_mask)`` where
-    ``labels`` has ``-100`` for all non-assistant token positions and ``think_mask``
-    is ``True`` for tokens inside ``<think>...</think>`` blocks.
+    Tokenize the full conversation and return ``(input_ids, labels, think_mask)``.
 
-    The context boundary for each assistant turn is ``<|im_start|>assistant\\n``
-    (add_generation_prompt without enable_thinking), so the opening ``<think>\\n``
-    token is included in the prediction target.
+    ``messages[-1]`` MUST be an assistant message; raises ``ValueError`` otherwise.
+    Labels are ``-100`` everywhere except the last assistant turn. ``think_mask``
+    is ``True`` for tokens inside the ``<think>...</think>`` block of that turn.
+
+    The think block is located by searching the formatted assistant turn text
+    (not ``content`` directly) so it works regardless of whether the dataset
+    stores reasoning in ``content`` or a separate field handled by the template.
     """
+    if not messages or messages[-1]["role"] != "assistant":
+        raise ValueError("last message must be an assistant message")
+
     full_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
     full_ids = tokenizer.encode(full_text)
     labels = [-100] * len(full_ids)
     think_mask = [False] * len(full_ids)
 
-    for i, msg in enumerate(messages):
-        if msg["role"] != "assistant":
-            continue
-        content = msg.get("content") or ""
-        context_text = tokenizer.apply_chat_template(
-            messages[:i], tokenize=False, add_generation_prompt=True
-        )
-        turn_end_text = tokenizer.apply_chat_template(
-            messages[:i + 1], tokenize=False, add_generation_prompt=False
-        )
-        n_context = len(tokenizer.encode(context_text))
-        n_end = min(len(tokenizer.encode(turn_end_text)), len(full_ids))
-        for pos in range(n_context, n_end):
-            labels[pos] = full_ids[pos]
+    context_text = tokenizer.apply_chat_template(
+        messages[:-1], tokenize=False, add_generation_prompt=True
+    )
+    n_context = len(tokenizer.encode(context_text))
 
-        m = re.search(r"^<think>.*?</think>\n\n", content, re.DOTALL)
-        if m:
-            n_think_end = min(len(tokenizer.encode(context_text + content[:m.end()])), n_end)
-            for pos in range(n_context, n_think_end):
-                think_mask[pos] = True
+    for pos in range(n_context, len(full_ids)):
+        labels[pos] = full_ids[pos]
 
-    def get_masked():
-        thoughts = []
-        last_tmask = False
-        for id, tmask in zip(full_ids, think_mask):
-            if tmask:
-                if not last_tmask:
-                    thoughts.append([])
-                thoughts[-1].append(id)
-                last_tmask = True
-            else:
-                last_tmask = False
-        for i, thought in enumerate(thoughts):
-            print(f"Thought {i}: {tokenizer.decode(thought)}")
+    # Search in the formatted turn text so we find the block even when content
+    # doesn't include <think> tags (template injects them from a separate field).
+    assistant_turn_text = full_text[len(context_text):]
+    m = re.search(r"^<think>.*?</think>\n\n", assistant_turn_text, re.DOTALL)
+    if m:
+        n_think_end = min(
+            len(tokenizer.encode(context_text + assistant_turn_text[:m.end()])),
+            len(full_ids),
+        )
+        for pos in range(n_context, n_think_end):
+            think_mask[pos] = True
 
     return full_ids, labels, think_mask
 
@@ -316,6 +306,13 @@ class SpeculativeAcceptanceCallback(TrainerCallback):
                     wandb.log({**all_metrics, "train/global_step": state.global_step})
 
     def _run_full_eval(self, model, device, entry: FullEvalEntry) -> dict[str, float]:
+        """
+        Evaluate next-token accuracy on every assistant turn in each sample.
+
+        Each turn is evaluated independently: the KV cache is built from scratch
+        for that turn's full prefix (all prior turns, with reasoning stripped by
+        the chat template) and discarded between turns.
+        """
         total_correct = total_tokens = 0
         think_correct = think_tokens = 0
         nothink_correct = nothink_tokens = 0
@@ -329,55 +326,199 @@ class SpeculativeAcceptanceCallback(TrainerCallback):
                 if m["role"] == "assistant":
                     m["content"] = _qwen3_convert_glm_think_blocks(m["content"])
 
-            input_ids, label_ids, think_mask = _build_sequence_with_labels(messages, self.tokenizer)
-            if entry.max_length is not None:
-                input_ids  = input_ids[:entry.max_length]
-                label_ids  = label_ids[:entry.max_length]
-                think_mask = think_mask[:entry.max_length]
-
-            seq_len = len(input_ids)
-            ids_t        = torch.tensor([input_ids], dtype=torch.long, device=device)
-            shift_labels = torch.tensor(label_ids[1:],  dtype=torch.long, device=device)
-            shift_think  = torch.tensor(think_mask[1:], dtype=torch.bool, device=device)
-
-            past_key_values = None
-            for chunk_start in range(0, seq_len, chunk_size):
-                chunk_end = min(chunk_start + chunk_size, seq_len)
-                with torch.inference_mode():
-                    out = model(
-                        input_ids=ids_t[:, chunk_start:chunk_end],
-                        past_key_values=past_key_values,
-                        use_cache=True,
+            asst_indices = [i for i, m in enumerate(messages) if m["role"] == "assistant"]
+            for asst_idx in asst_indices:
+                turn_messages = messages[:asst_idx + 1]
+                try:
+                    input_ids, label_ids, think_mask = _build_sequence_with_labels(
+                        turn_messages, self.tokenizer
                     )
-                past_key_values = out.past_key_values
+                except ValueError:
+                    continue
 
-                # logits[j] predicts position chunk_start+j+1; last token predicts past end
-                pred_end = min(chunk_end, seq_len - 1)
-                n_preds = pred_end - chunk_start
-                if n_preds > 0:
-                    preds   = out.logits[0, :n_preds].argmax(dim=-1)
-                    lbls    = shift_labels[chunk_start:pred_end]
-                    tmask   = shift_think[chunk_start:pred_end]
-                    lbl_mask = lbls != -100
-                    correct  = (preds == lbls) & lbl_mask
+                if entry.max_length is not None:
+                    input_ids  = input_ids[:entry.max_length]
+                    label_ids  = label_ids[:entry.max_length]
+                    think_mask = think_mask[:entry.max_length]
 
-                    total_correct   += correct.sum().item()
-                    total_tokens    += lbl_mask.sum().item()
-                    think_correct   += (correct &  tmask).sum().item()
-                    think_tokens    += (lbl_mask &  tmask).sum().item()
-                    nothink_correct += (correct & ~tmask).sum().item()
-                    nothink_tokens  += (lbl_mask & ~tmask).sum().item()
-                del out
+                seq_len = len(input_ids)
+                ids_t        = torch.tensor([input_ids], dtype=torch.long, device=device)
+                shift_labels = torch.tensor(label_ids[1:],  dtype=torch.long, device=device)
+                shift_think  = torch.tensor(think_mask[1:], dtype=torch.bool, device=device)
+
+                past_key_values = None
+                for chunk_start in range(0, seq_len, chunk_size):
+                    chunk_end = min(chunk_start + chunk_size, seq_len)
+                    with torch.inference_mode():
+                        out = model(
+                            input_ids=ids_t[:, chunk_start:chunk_end],
+                            past_key_values=past_key_values,
+                            use_cache=True,
+                        )
+                    past_key_values = out.past_key_values
+
+                    pred_end = min(chunk_end, seq_len - 1)
+                    n_preds = pred_end - chunk_start
+                    if n_preds > 0:
+                        preds    = out.logits[0, :n_preds].argmax(dim=-1)
+                        lbls     = shift_labels[chunk_start:pred_end]
+                        tmask    = shift_think[chunk_start:pred_end]
+                        lbl_mask = lbls != -100
+                        correct  = (preds == lbls) & lbl_mask
+
+                        total_correct   += correct.sum().item()
+                        total_tokens    += lbl_mask.sum().item()
+                        think_correct   += (correct &  tmask).sum().item()
+                        think_tokens    += (lbl_mask &  tmask).sum().item()
+                        nothink_correct += (correct & ~tmask).sum().item()
+                        nothink_tokens  += (lbl_mask & ~tmask).sum().item()
+                    del out
+                del past_key_values
 
         if total_tokens == 0:
             return {}
 
-        out = {f"full_eval/{entry.name}/mean_token_accuracy": total_correct / total_tokens}
+        result = {f"full_eval/{entry.name}/mean_token_accuracy": total_correct / total_tokens}
         if think_tokens > 0:
-            out[f"full_eval/{entry.name}/mean_token_accuracy_think"]   = think_correct / think_tokens
+            result[f"full_eval/{entry.name}/mean_token_accuracy_think"]   = think_correct / think_tokens
         if nothink_tokens > 0:
-            out[f"full_eval/{entry.name}/mean_token_accuracy_nothink"] = nothink_correct / nothink_tokens
-        return out
+            result[f"full_eval/{entry.name}/mean_token_accuracy_nothink"] = nothink_correct / nothink_tokens
+        return result
+
+    def _run_full_eval_with_caching(self, model, device, entry: FullEvalEntry) -> dict[str, float]:
+        """
+        Like ``_run_full_eval`` but reuses KV cache across turns within a sample.
+
+        For each assistant turn j the cached prefix covers all tokens before that
+        turn's response (context tokens with no reasoning, since the chat template
+        strips prior turns' think blocks). Moving to turn j+1 extends the cache
+        with the stripped response of turn j plus the next user message, avoiding
+        a full recompute of the growing prefix.
+
+        Results are bit-identical to ``_run_full_eval``: the token sequence seen
+        by the model for each evaluated turn is the same; only the forward-pass
+        order differs.
+        """
+        total_correct = total_tokens = 0
+        think_correct = think_tokens = 0
+        nothink_correct = nothink_tokens = 0
+        chunk_size = 2048
+
+        for sample in entry.eval_samples:
+            messages = sample.get("messages") or sample.get("conversations") or []
+            if not messages:
+                continue
+            for m in messages:
+                if m["role"] == "assistant":
+                    m["content"] = _qwen3_convert_glm_think_blocks(m["content"])
+
+            asst_indices = [i for i, m in enumerate(messages) if m["role"] == "assistant"]
+            prefix_kv  = None
+            prefix_len = 0  # tokens already in prefix_kv
+
+            for turn_num, asst_idx in enumerate(asst_indices):
+                turn_messages = messages[:asst_idx + 1]
+                try:
+                    input_ids, label_ids, think_mask = _build_sequence_with_labels(
+                        turn_messages, self.tokenizer
+                    )
+                except ValueError:
+                    prefix_kv  = None
+                    prefix_len = 0
+                    continue
+
+                if entry.max_length is not None:
+                    input_ids  = input_ids[:entry.max_length]
+                    label_ids  = label_ids[:entry.max_length]
+                    think_mask = think_mask[:entry.max_length]
+
+                seq_len = len(input_ids)
+
+                # First labeled position = start of this turn's assistant tokens.
+                n_context = next((i for i, l in enumerate(label_ids) if l != -100), seq_len)
+
+                ids_t        = torch.tensor([input_ids], dtype=torch.long, device=device)
+                shift_labels = torch.tensor(label_ids[1:],  dtype=torch.long, device=device)
+                shift_think  = torch.tensor(think_mask[1:], dtype=torch.bool, device=device)
+
+                # Step 1 — extend prefix cache to n_context (no-op for turns > 0
+                # because Step 3 of the previous turn already built up to here).
+                if n_context > prefix_len:
+                    with torch.inference_mode():
+                        ctx_out = model(
+                            input_ids=ids_t[:, prefix_len:n_context],
+                            past_key_values=prefix_kv,
+                            use_cache=True,
+                        )
+                    prefix_kv  = ctx_out.past_key_values
+                    prefix_len = n_context
+                    del ctx_out
+
+                # Step 2 — evaluate the assistant turn using the cached prefix.
+                eval_kv = prefix_kv
+                for chunk_start in range(n_context, seq_len, chunk_size):
+                    chunk_end = min(chunk_start + chunk_size, seq_len)
+                    with torch.inference_mode():
+                        out = model(
+                            input_ids=ids_t[:, chunk_start:chunk_end],
+                            past_key_values=eval_kv,
+                            use_cache=True,
+                        )
+                    eval_kv = out.past_key_values
+
+                    pred_end = min(chunk_end, seq_len - 1)
+                    n_preds  = pred_end - chunk_start
+                    if n_preds > 0:
+                        preds    = out.logits[0, :n_preds].argmax(dim=-1)
+                        lbls     = shift_labels[chunk_start:pred_end]
+                        tmask    = shift_think[chunk_start:pred_end]
+                        lbl_mask = lbls != -100
+                        correct  = (preds == lbls) & lbl_mask
+
+                        total_correct   += correct.sum().item()
+                        total_tokens    += lbl_mask.sum().item()
+                        think_correct   += (correct &  tmask).sum().item()
+                        think_tokens    += (lbl_mask &  tmask).sum().item()
+                        nothink_correct += (correct & ~tmask).sum().item()
+                        nothink_tokens  += (lbl_mask & ~tmask).sum().item()
+                    del out
+                del eval_kv
+
+                # Step 3 — build the prefix cache for the next turn.
+                # The next turn's context = apply_chat_template(messages[:next_asst_idx],
+                # add_generation_prompt=True). This strips reasoning from the current
+                # turn (now intermediate) and appends the next user message + prompt.
+                # We only need to forward the new suffix tokens (from prefix_len on).
+                next_turn = turn_num + 1
+                if next_turn < len(asst_indices):
+                    next_asst_idx  = asst_indices[next_turn]
+                    next_ctx_text  = self.tokenizer.apply_chat_template(
+                        messages[:next_asst_idx], tokenize=False, add_generation_prompt=True
+                    )
+                    next_ctx_ids = self.tokenizer.encode(next_ctx_text)
+                    if len(next_ctx_ids) > prefix_len:
+                        new_tokens = torch.tensor(
+                            [next_ctx_ids[prefix_len:]], dtype=torch.long, device=device
+                        )
+                        with torch.inference_mode():
+                            nxt_out = model(
+                                input_ids=new_tokens,
+                                past_key_values=prefix_kv,
+                                use_cache=True,
+                            )
+                        prefix_kv  = nxt_out.past_key_values
+                        prefix_len = len(next_ctx_ids)
+                        del nxt_out
+
+        if total_tokens == 0:
+            return {}
+
+        result = {f"full_eval/{entry.name}/mean_token_accuracy": total_correct / total_tokens}
+        if think_tokens > 0:
+            result[f"full_eval/{entry.name}/mean_token_accuracy_think"]   = think_correct / think_tokens
+        if nothink_tokens > 0:
+            result[f"full_eval/{entry.name}/mean_token_accuracy_nothink"] = nothink_correct / nothink_tokens
+        return result
 
     def _run(self, model, device, entry: SpecDecEvalEntry) -> dict[str, float]:
         d, n = entry.d_tokens, entry.n_drafts
