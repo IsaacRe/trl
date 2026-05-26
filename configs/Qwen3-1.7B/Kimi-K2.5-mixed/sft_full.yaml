@@ -1,0 +1,113 @@
+# Full fine-tuning: Qwen3-1.7B on a 1:1 interleaved mix of
+#   - lambda/hermes-agent-reasoning-traces (kimi)
+#   - trjxter/Kimi-K2.6-Reasoning-3300x-WandB
+#
+# Run with:
+#   CUDA_VISIBLE_DEVICES=0 .venv/bin/python scripts/train_sft.py \
+#     --config configs/Qwen3-1.7B/Kimi-K2.5-mixed/sft_full.yaml
+
+# Dataset — 1:1 interleave of two sources.
+# When `interleave_datasets` is set, `dataset_name` is ignored; only
+# `dataset_train_split` is used (passed as `split=` to each source).
+#
+# Per-spec keys:
+#   streaming (default true)  load as IterableDataset; required for very large sets
+#   shuffle   (default false) only valid with streaming=false. Loads the dataset
+#                             into memory, then wraps it as an infinite stream
+#                             that reshuffles with a new seed on every pass —
+#                             so successive epochs see a different order.
+#
+# Stopping: if any spec uses shuffle=true (infinite stream), the interleaved mix
+# uses `first_exhausted`; otherwise `all_exhausted`. Either way max_steps caps
+# the run.
+dataset_train_split: train
+dataset_streaming: true
+interleave_datasets:
+  - path: lambda/hermes-agent-reasoning-traces
+    name: kimi
+    streaming: false   # 7646 rows, fits in RAM — load as Dataset to enable shuffle
+    shuffle: true      # reshuffle each pass for varied order across epochs
+  - path: Jackrong/Kimi-K2.5-Reasoning-1M-Cleaned
+    name: General-Distillation
+    streaming: true    # 100K–1M rows, stays streamed
+
+# Model
+model_name_or_path: Qwen/Qwen3-1.7B
+dtype: bfloat16
+attn_implementation: sdpa
+
+# Output
+output_dir: ""
+run_name: kimi_mixed_sft
+report_to: none
+
+# Training hyperparameters
+max_steps: 2000
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 32
+learning_rate: 2.0e-5
+lr_scheduler_type: cosine
+warmup_ratio: 0.05
+weight_decay: 0.01
+
+# Sequence length
+max_length: 32_000
+packing: false
+
+# Precision & memory
+bf16: true
+gradient_checkpointing: true
+gradient_checkpointing_kwargs:
+  use_reentrant: false
+
+# Loss mode — pick ONE:
+#   assistant_only_loss: true   trains on ALL assistant turns (intermediate turns
+#                               have reasoning stripped by the Qwen3 template;
+#                               final turn retains its <think> block)
+#   completion_only_loss: true  trains ONLY on the sampled final assistant turn
+#                               (with reasoning); uses prompt-completion format
+assistant_only_loss: true
+# completion_only_loss: true
+
+# Logging & evaluation
+logging_steps: 1
+eval_strategy: "no"
+save_strategy: steps
+save_steps: 200
+# save_total_limit: 3
+
+# Misc
+dataloader_num_workers: 1
+
+# Full forward-pass eval (loss, token accuracy, entropy)
+full_eval:
+  eval_steps: 10
+  datasets:
+    - dataset: data/kimi-k2.6-claude-code-traces.parquet
+      name: claude-code
+      n_samples: 5
+      max_turns: 10
+      max_length:
+    - dataset: data/kimi-k2.6-agent.parquet
+      name: codex
+      n_samples: 5
+      max_turns: 10
+      max_length:
+
+spec_dec_eval:
+  eval_steps: 50
+  datasets:
+    - dataset: data/kimi-k2.6-claude-code-traces.parquet
+      name: claude-code
+      n_drafts: 4
+      n_samples: 3
+      d_tokens: 16
+      max_characters: 8000
+      temperature: 0.6
+    - dataset: data/kimi-k2.6-agent.parquet
+      name: codex
+      n_drafts: 4
+      n_samples: 3
+      d_tokens: 16
+      max_characters: 8000
+      temperature: 0.6

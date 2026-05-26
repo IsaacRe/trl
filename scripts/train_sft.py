@@ -75,6 +75,25 @@ def _load_yaml_eval_section(argv: list[str], key: str, cls: type) -> list:
     return []
 
 
+def _read_yaml_scalar(argv: list[str], key: str, default=None):
+    """Return a value from the YAML --config file, or ``default`` if absent."""
+    import yaml
+    for i, arg in enumerate(argv):
+        if arg == "--config" and i + 1 < len(argv):
+            with open(argv[i + 1]) as f:
+                return yaml.safe_load(f).get(key, default)
+    return default
+
+
+def _infinite_reshuffled(ds, base_seed: int):
+    """Yield examples from ``ds`` forever, reshuffling with a new seed each pass."""
+    epoch = 0
+    while True:
+        for ex in ds.shuffle(seed=base_seed + epoch):
+            yield ex
+        epoch += 1
+
+
 
 def _make_turn_sampler(seed: int):
     """Return a dataset map function that randomly selects one assistant turn as the
@@ -171,7 +190,38 @@ def main(script_args, training_args, model_args, dataset_args, spec_dec_args):
     # ------------------------------------------------------------------
     # Dataset
     # ------------------------------------------------------------------
-    if dataset_args.datasets and script_args.dataset_name:
+    interleave_specs = _read_yaml_scalar(sys.argv, "interleave_datasets", []) or []
+    if interleave_specs:
+        from datasets import IterableDataset, IterableDatasetDict, interleave_datasets
+
+        streams = []
+        any_infinite = False
+        for s in interleave_specs:
+            streaming = s.get("streaming", True)
+            ds = load_dataset(
+                s["path"], name=s.get("name"), streaming=streaming, split=script_args.dataset_train_split
+            )
+            if not streaming and s.get("shuffle", False):
+                # Wrap a map-style Dataset as an infinite IterableDataset that
+                # reshuffles every pass — so each epoch sees a different order.
+                ds = IterableDataset.from_generator(
+                    _infinite_reshuffled,
+                    gen_kwargs={"ds": ds, "base_seed": training_args.seed},
+                )
+                any_infinite = True
+            streams.append(ds)
+        n = len(streams)
+        # With an infinite stream, "all_exhausted" would never terminate; use
+        # "first_exhausted" and let max_steps cap the run.
+        stopping_strategy = "first_exhausted" if any_infinite else "all_exhausted"
+        interleaved = interleave_datasets(
+            streams,
+            probabilities=[1.0 / n] * n,
+            stopping_strategy=stopping_strategy,
+            seed=training_args.seed,
+        )
+        dataset = IterableDatasetDict({script_args.dataset_train_split: interleaved})
+    elif dataset_args.datasets and script_args.dataset_name:
         logger.warning(
             "Both `datasets` and `dataset_name` are provided. The `datasets` argument will be used to load the "
             "dataset and `dataset_name` will be ignored."
@@ -184,7 +234,7 @@ def main(script_args, training_args, model_args, dataset_args, spec_dec_args):
             script_args.dataset_name, name=script_args.dataset_config, streaming=script_args.dataset_streaming
         )
     else:
-        raise ValueError("Either `datasets` or `dataset_name` must be provided.")
+        raise ValueError("Either `datasets`, `dataset_name`, or `interleave_datasets` must be provided.")
 
     # Remap ShareGPT role names and convert to ChatML format before TRL processes them
     dataset = dataset.map(lambda ex: maybe_convert_to_chatml(remap_roles(ex)))
