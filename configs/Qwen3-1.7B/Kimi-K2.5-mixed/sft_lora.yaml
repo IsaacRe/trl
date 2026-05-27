@@ -21,6 +21,8 @@
 #                             Entries that omit it share the leftover mass
 #                             (1 - sum of explicit ratios) evenly. If every entry
 #                             sets a ratio, they must sum to 1.
+#   skip_samples (default 0)  drop the first N rows of this source up front,
+#                             before any shuffling (same rows excluded every epoch).
 #
 # Stopping: if any spec uses shuffle=true (infinite stream), the interleaved mix
 # uses `first_exhausted`; otherwise `all_exhausted`. Either way max_steps caps
@@ -32,9 +34,12 @@ interleave_datasets:
     name: kimi
     streaming: false   # 7646 rows, fits in RAM — load as Dataset to enable shuffle
     shuffle: true      # reshuffle each pass for varied order across epochs
+    skip_samples: 50
+    ratio: 0.25
   - path: Jackrong/Kimi-K2.5-Reasoning-1M-Cleaned
     name: General-Distillation
     streaming: true    # 100K–1M rows, stays streamed
+    skip_samples: 50
 
 # Model
 model_name_or_path: Qwen/Qwen3-1.7B
@@ -109,21 +114,51 @@ full_eval:
       n_samples: 5
       max_turns: 10
       max_length:
+    # Held-out first 50 rows of each train source
+    - dataset: lambda/hermes-agent-reasoning-traces
+      dataset_config: kimi
+      name: hermes-kimi-heldout
+      n_samples: 50
+      max_turns: 10
+      max_length:
+    - dataset: Jackrong/Kimi-K2.5-Reasoning-1M-Cleaned
+      dataset_config: General-Distillation
+      name: reasoning-kimi-heldout
+      n_samples: 50
+      max_turns: 10
+      max_length:
 
 spec_dec_eval:
-  eval_steps: 50
+  eval_steps: 100
   datasets:
     - dataset: data/kimi-k2.6-claude-code-traces.parquet
       name: claude-code
       n_drafts: 4
-      n_samples: 3
+      n_samples: 10
       d_tokens: 16
-      max_characters: 8000
+      max_characters: 16000
       temperature: 0.6
     - dataset: data/kimi-k2.6-agent.parquet
       name: codex
       n_drafts: 4
-      n_samples: 3
+      n_samples: 10
       d_tokens: 16
-      max_characters: 8000
+      max_characters: 16000
+      temperature: 0.6
+    # Held-out first 50 rows of each train source (skipped during training).
+    - dataset: lambda/hermes-agent-reasoning-traces
+      dataset_config: kimi
+      name: hermes-heldout
+      n_drafts: 4
+      n_samples: 10
+      d_tokens: 16
+      max_characters: 16000
+      temperature: 0.6
+    - dataset: Jackrong/Kimi-K2.5-Reasoning-1M-Cleaned
+      dataset_config: General-Distillation
+      name: reasoning-heldout
+      n_drafts: 4
+      n_samples: 10
+      d_tokens: 16
+      max_characters: 16000
       temperature: 0.6

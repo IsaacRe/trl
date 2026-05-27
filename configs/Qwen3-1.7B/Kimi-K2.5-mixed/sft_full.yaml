@@ -20,6 +20,8 @@
 #                             Entries that omit it share the leftover mass
 #                             (1 - sum of explicit ratios) evenly. If every entry
 #                             sets a ratio, they must sum to 1.
+#   skip_samples (default 0)  drop the first N rows of this source up front,
+#                             before any shuffling (same rows excluded every epoch).
 #
 # Stopping: if any spec uses shuffle=true (infinite stream), the interleaved mix
 # uses `first_exhausted`; otherwise `all_exhausted`. Either way max_steps caps

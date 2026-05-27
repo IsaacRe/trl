@@ -31,8 +31,10 @@ _ROLE_MAP = {"human": "user", "gpt": "assistant"}
 @dataclasses.dataclass
 class BaseEvalConfig:
     dataset: str
+    dataset_config: str | None = None
     name: str = ""
     n_samples: int = 10
+    skip_samples: int = 0
     max_turns: int | None = None
     eval_steps: int | None = None
 
@@ -203,6 +205,11 @@ def main(script_args, training_args, model_args, dataset_args, spec_dec_args):
             ds = load_dataset(
                 s["path"], name=s.get("name"), streaming=streaming, split=script_args.dataset_train_split
             )
+            # Skip the first `skip_samples` rows up front — before any shuffling,
+            # so the same rows are excluded on every epoch.
+            skip = s.get("skip_samples", 0)
+            if skip:
+                ds = ds.skip(skip) if streaming else ds.select(range(skip, len(ds)))
             if not streaming and s.get("shuffle", False):
                 # Wrap a map-style Dataset as an infinite IterableDataset that
                 # reshuffles every pass — so each epoch sees a different order.
@@ -265,22 +272,24 @@ def main(script_args, training_args, model_args, dataset_args, spec_dec_args):
     # ------------------------------------------------------------------
 
     def _load_samples(cfg: SpecDecEvalConfig | FullEvalConfig) -> list[dict]:
+        # Skip the first `skip_samples`, then take the next `n_samples`.
+        start, stop = cfg.skip_samples, cfg.skip_samples + cfg.n_samples
         if cfg.dataset == script_args.dataset_name:
             raw = [
                 maybe_convert_to_chatml(remap_roles(dict(s)))
-                for s in itertools.islice(dataset[script_args.dataset_train_split], cfg.n_samples)
+                for s in itertools.islice(dataset[script_args.dataset_train_split], start, stop)
             ]
         elif os.path.exists(cfg.dataset):
             _stream = load_dataset("parquet", data_files=cfg.dataset, streaming=True, split="train")
             raw = [
                 maybe_convert_to_chatml(remap_roles(dict(s)))
-                for s in itertools.islice(_stream, cfg.n_samples)
+                for s in itertools.islice(_stream, start, stop)
             ]
         else:
-            _stream = load_dataset(cfg.dataset, streaming=True, split="train")
+            _stream = load_dataset(cfg.dataset, name=cfg.dataset_config, streaming=True, split="train")
             raw = [
                 maybe_convert_to_chatml(remap_roles(dict(s)))
-                for s in itertools.islice(_stream, cfg.n_samples)
+                for s in itertools.islice(_stream, start, stop)
             ]
         if cfg.max_turns is not None:
             for s in raw:
