@@ -213,12 +213,30 @@ def main(script_args, training_args, model_args, dataset_args, spec_dec_args):
                 any_infinite = True
             streams.append(ds)
         n = len(streams)
+        # Sampling ratios. A spec may set an explicit `ratio`; entries that omit
+        # it share the leftover mass (1 - sum of explicit ratios) evenly. If every
+        # entry sets a ratio, they must sum to 1.
+        ratios = [s.get("ratio") for s in interleave_specs]
+        n_unset = sum(r is None for r in ratios)
+        set_sum = sum(r for r in ratios if r is not None)
+        if n_unset == 0:
+            if abs(set_sum - 1.0) > 1e-6:
+                raise ValueError(f"interleave_datasets ratios are all set but sum to {set_sum}, must sum to 1.")
+            probabilities = ratios
+        else:
+            if set_sum > 1.0 + 1e-6:
+                raise ValueError(
+                    f"interleave_datasets ratios sum to {set_sum} > 1, leaving no mass for the {n_unset} "
+                    "entries without a ratio."
+                )
+            fill = (1.0 - set_sum) / n_unset
+            probabilities = [fill if r is None else r for r in ratios]
         # With an infinite stream, "all_exhausted" would never terminate; use
         # "first_exhausted" and let max_steps cap the run.
         stopping_strategy = "first_exhausted" if any_infinite else "all_exhausted"
         interleaved = interleave_datasets(
             streams,
-            probabilities=[1.0 / n] * n,
+            probabilities=probabilities,
             stopping_strategy=stopping_strategy,
             seed=training_args.seed,
         )

@@ -17,6 +17,10 @@
 #                             into memory, then wraps it as an infinite stream
 #                             that reshuffles with a new seed on every pass —
 #                             so successive epochs see a different order.
+#   ratio     (default even)  fraction of each batch sampled from this source.
+#                             Entries that omit it share the leftover mass
+#                             (1 - sum of explicit ratios) evenly. If every entry
+#                             sets a ratio, they must sum to 1.
 #
 # Stopping: if any spec uses shuffle=true (infinite stream), the interleaved mix
 # uses `first_exhausted`; otherwise `all_exhausted`. Either way max_steps caps
