@@ -35,7 +35,7 @@ interleave_datasets:
     streaming: false   # 7646 rows, fits in RAM — load as Dataset to enable shuffle
     shuffle: true      # reshuffle each pass for varied order across epochs
     skip_samples: 50
-    ratio: 0.25
+    # ratio: 0.25
   - path: Jackrong/Kimi-K2.5-Reasoning-1M-Cleaned
     name: General-Distillation
     streaming: true    # 100K–1M rows, stays streamed
@@ -87,8 +87,8 @@ gradient_checkpointing_kwargs:
 #                               final turn retains its <think> block)
 #   completion_only_loss: true   trains ONLY on the sampled final assistant turn
 #                               (with reasoning); uses prompt-completion format
-# assistant_only_loss: true
-completion_only_loss: true
+assistant_only_loss: true
+# completion_only_loss: true
 
 # Logging & evaluation
 logging_steps: 1
@@ -129,36 +129,36 @@ full_eval:
       max_length:
 
 spec_dec_eval:
-  eval_steps: 100
+  eval_steps: 50
   datasets:
     - dataset: data/kimi-k2.6-claude-code-traces.parquet
       name: claude-code
       n_drafts: 4
       n_samples: 10
       d_tokens: 16
-      max_characters: 16000
+      max_characters: 32000
       temperature: 0.6
     - dataset: data/kimi-k2.6-agent.parquet
       name: codex
       n_drafts: 4
       n_samples: 10
       d_tokens: 16
-      max_characters: 16000
+      max_characters: 32000
       temperature: 0.6
     # Held-out first 50 rows of each train source (skipped during training).
     - dataset: lambda/hermes-agent-reasoning-traces
       dataset_config: kimi
       name: hermes-heldout
       n_drafts: 4
-      n_samples: 10
+      n_samples: 20
       d_tokens: 16
-      max_characters: 16000
+      max_characters: 32000
       temperature: 0.6
     - dataset: Jackrong/Kimi-K2.5-Reasoning-1M-Cleaned
       dataset_config: General-Distillation
       name: reasoning-heldout
       n_drafts: 4
-      n_samples: 10
+      n_samples: 20
       d_tokens: 16
-      max_characters: 16000
+      max_characters: 32000
       temperature: 0.6
