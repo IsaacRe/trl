@@ -35,6 +35,7 @@ class BaseEvalConfig:
     name: str = ""
     n_samples: int = 10
     skip_samples: int = 0
+    shuffle: bool = False
     max_turns: int | None = None
     eval_steps: int | None = None
 
@@ -272,25 +273,22 @@ def main(script_args, training_args, model_args, dataset_args, spec_dec_args):
     # ------------------------------------------------------------------
 
     def _load_samples(cfg: SpecDecEvalConfig | FullEvalConfig) -> list[dict]:
-        # Skip the first `skip_samples`, then take the next `n_samples`.
+        # Skip the first `skip_samples`, then take the next `n_samples`. When
+        # `shuffle` is set the dataset is loaded non-streaming and shuffled
+        # before slicing — streaming and shuffling are mutually exclusive.
         start, stop = cfg.skip_samples, cfg.skip_samples + cfg.n_samples
         if cfg.dataset == script_args.dataset_name:
-            raw = [
-                maybe_convert_to_chatml(remap_roles(dict(s)))
-                for s in itertools.islice(dataset[script_args.dataset_train_split], start, stop)
-            ]
+            src = dataset[script_args.dataset_train_split]
         elif os.path.exists(cfg.dataset):
-            _stream = load_dataset("parquet", data_files=cfg.dataset, streaming=True, split="train")
-            raw = [
-                maybe_convert_to_chatml(remap_roles(dict(s)))
-                for s in itertools.islice(_stream, start, stop)
-            ]
+            src = load_dataset("parquet", data_files=cfg.dataset, streaming=not cfg.shuffle, split="train")
         else:
-            _stream = load_dataset(cfg.dataset, name=cfg.dataset_config, streaming=True, split="train")
-            raw = [
-                maybe_convert_to_chatml(remap_roles(dict(s)))
-                for s in itertools.islice(_stream, start, stop)
-            ]
+            src = load_dataset(cfg.dataset, name=cfg.dataset_config, streaming=not cfg.shuffle, split="train")
+        if cfg.shuffle:
+            src = src.shuffle(seed=training_args.seed)
+        raw = [
+            maybe_convert_to_chatml(remap_roles(dict(s)))
+            for s in itertools.islice(src, start, stop)
+        ]
         if cfg.max_turns is not None:
             for s in raw:
                 msgs = s.get("messages") or s.get("conversations") or []
