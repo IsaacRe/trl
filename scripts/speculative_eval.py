@@ -22,6 +22,7 @@ All positions k are 1-indexed relative to the start of each draft iteration.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from dataclasses import dataclass, field
@@ -49,6 +50,10 @@ class SpecDecConfig:
     spec_dec_eval_only: bool = field(
         default=False,
         metadata={"help": "Skip training and run evaluation only."},
+    )
+    spec_dec_batch_size: int = field(
+        default=1,
+        metadata={"help": "Number of samples whose draft requests are batched together during spec-dec eval."},
     )
 
 
@@ -176,39 +181,129 @@ def _assistant_turns(messages: list[dict], tokenizer, tools=None) -> list[tuple[
     return turns
 
 
-def _draft_completions(
-    model,
-    tokenizer,
-    context: str,
-    n: int,
-    d: int,
-    temperature: float,
-    device: torch.device,
-) -> list[list[int]]:
+def _request_seed(base_seed: int, i: int, j: int, step: int) -> int:
     """
-    Sample n continuations of up to d tokens each.  Returns a list of token-id
-    lists (EOS stripped), one per draft.
+    Derive a per-draft-request RNG seed from the stable ``(sample, turn, step)``
+    coordinates. Because the seed depends only on these coordinates — never on how
+    requests are grouped into batches — a given request samples the same drafts
+    whether it is decoded alone or alongside others.
     """
-    enc = tokenizer(context, return_tensors="pt").to(device)
-    input_len = enc["input_ids"].shape[1]
+    h = base_seed & 0x7FFFFFFFFFFFFFFF
+    for v in (i, j, step):
+        h = (h * 1000003 + v) & 0x7FFFFFFFFFFFFFFF
+    return h
 
+
+def _draft_batch(model, tokenizer, requests: list[dict], device: torch.device) -> list[list[list[int]]]:
+    """
+    Decode a batch of draft requests in a single set of forward passes.
+
+    Each request is a dict with keys:
+        ``context_ids`` (`list[int]`): tokenized context.
+        ``n`` (`int`): number of drafts to sample.
+        ``d`` (`int`): tokens per draft.
+        ``temperature`` (`float`): sampling temperature (``0`` → greedy).
+        ``seed`` (`int`): per-request RNG seed (see [`_request_seed`]).
+
+    All requests in a call share ``n`` and ``d`` (they come from one eval entry). Each
+    context is prefilled once; the KV cache is then expanded to ``n`` drafts before the
+    ``d`` decode steps, so the expensive context prefill runs once per request rather
+    than once per draft. A dedicated RNG generator per request (seeded with ``seed``
+    and reused across the ``d`` steps) makes each request's sampled tokens depend only
+    on its own logits and seed — so batching changes results only through floating-point
+    differences in the batched matmuls, never through RNG ordering.
+
+    Returns a list aligned with ``requests``; each element is a list of ``n`` token-id
+    lists with everything from the first EOS token onward removed.
+    """
+    B = len(requests)
+    n = requests[0]["n"]
+    d = requests[0]["d"]
+
+    lengths = [len(req["context_ids"]) for req in requests]
+    max_len = max(lengths)
+    pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+
+    # Prefill one row per unique context (left-padded so every row's last column is
+    # its final real context token). The n drafts are produced by expanding the KV
+    # cache afterwards, so the expensive context prefill runs once per request.
+    input_ids = torch.full((B, max_len), pad_id, dtype=torch.long, device=device)
+    attn = torch.zeros((B, max_len), dtype=torch.long, device=device)
+    for r, req in enumerate(requests):
+        L = lengths[r]
+        input_ids[r, max_len - L:] = torch.tensor(req["context_ids"], dtype=torch.long, device=device)
+        attn[r, max_len - L:] = 1
+    position_ids = attn.long().cumsum(-1).sub_(1).clamp_(min=0)
+
+    # One generator per request, reused across the d decode steps.
+    gens: list[torch.Generator | None] = []
+    temps: list[float] = []
+    for req in requests:
+        temps.append(req["temperature"])
+        if req["temperature"] > 0.0:
+            g = torch.Generator(device=device)
+            g.manual_seed(req["seed"])
+            gens.append(g)
+        else:
+            gens.append(None)
+
+    rows = B * n  # after expansion; request r owns rows [r*n : (r+1)*n]
+
+    def _sample(logits: torch.Tensor) -> torch.Tensor:  # (rows, V) -> (rows,)
+        tok = torch.empty(rows, dtype=torch.long, device=device)
+        for r_idx in range(B):
+            a, b = r_idx * n, r_idx * n + n
+            lg = logits[a:b].float()
+            if gens[r_idx] is None:
+                tok[a:b] = lg.argmax(dim=-1)
+            else:
+                probs = torch.softmax(lg / temps[r_idx], dim=-1)
+                tok[a:b] = torch.multinomial(probs, 1, generator=gens[r_idx]).squeeze(-1)
+        return tok
+
+    generated = torch.empty((rows, d), dtype=torch.long, device=device)
     with torch.inference_mode():
-        out = model.generate(
-            **enc,
-            max_new_tokens=d,
-            num_return_sequences=n,
-            do_sample=(temperature > 0.0),
-            temperature=temperature if temperature > 0.0 else None,
-            pad_token_id=tokenizer.pad_token_id,
+        # logits_to_keep=1: only the final position's logits are computed, so the
+        # full (B, seq_len, vocab) tensor is never materialized during prefill.
+        out = model(
+            input_ids=input_ids, attention_mask=attn, position_ids=position_ids,
+            use_cache=True, logits_to_keep=1,
         )
+        # Expand the single-context prefill to n drafts per request (contiguously:
+        # [r0,r0,…, r1,r1,…]). batch_repeat_interleave grows the KV cache in place.
+        past = out.past_key_values
+        past.batch_repeat_interleave(n)
+        logits  = out.logits[:, -1, :].repeat_interleave(n, dim=0)
+        attn    = attn.repeat_interleave(n, dim=0)
+        cur_pos = position_ids[:, -1].repeat_interleave(n, dim=0)
+        for t in range(d):
+            tok = _sample(logits)
+            generated[:, t] = tok
+            if t == d - 1:
+                break
+            cur_pos = cur_pos + 1
+            attn = torch.cat([attn, torch.ones((rows, 1), dtype=torch.long, device=device)], dim=1)
+            out = model(
+                input_ids=tok.unsqueeze(1),
+                attention_mask=attn,
+                position_ids=cur_pos.unsqueeze(1),
+                past_key_values=past,
+                use_cache=True,
+                logits_to_keep=1,
+            )
+            past = out.past_key_values
+            logits = out.logits[:, -1, :]
 
     eos_id = tokenizer.eos_token_id
-    results = []
-    for i in range(n):
-        ids = out[i, input_len:].tolist()
-        if eos_id is not None and eos_id in ids:
-            ids = ids[: ids.index(eos_id)]
-        results.append(ids)
+    results: list[list[list[int]]] = []
+    for r_idx in range(B):
+        drafts = []
+        for r in range(r_idx * n, r_idx * n + n):
+            ids = generated[r].tolist()
+            if eos_id is not None and eos_id in ids:
+                ids = ids[: ids.index(eos_id)]
+            drafts.append(ids)
+        results.append(drafts)
     return results
 
 
@@ -263,10 +358,11 @@ class SpeculativeAcceptanceCallback(TrainerCallback):
             each carrying its own samples and drafting hyperparameters.
     """
 
-    def __init__(self, tokenizer, eval_entries: list[SpecDecEvalEntry], full_eval_entries: list[FullEvalEntry]):
+    def __init__(self, tokenizer, eval_entries: list[SpecDecEvalEntry], full_eval_entries: list[FullEvalEntry], batch_size: int = 1):
         self.tokenizer = tokenizer
         self.eval_entries = eval_entries
         self.full_eval_entries = full_eval_entries
+        self.batch_size = batch_size
 
     def on_step_end(
         self,
@@ -304,7 +400,7 @@ class SpeculativeAcceptanceCallback(TrainerCallback):
             for entry in spec_dec_entries:
                 logger.warning("Running spec dec eval on %d samples [%s]…", len(entry.eval_samples), entry.name)
                 try:
-                    all_metrics.update(self._run(model, device, entry))
+                    all_metrics.update(self._run(model, device, entry, batch_size=self.batch_size, seed=args.seed))
                 except Exception:
                     logger.exception("Spec dec eval failed for entry %s", entry.name)
         finally:
@@ -535,22 +631,57 @@ class SpeculativeAcceptanceCallback(TrainerCallback):
             result[f"full_eval/{entry.name}/mean_token_accuracy_nothink"] = nothink_correct / nothink_tokens
         return result
 
-    def _run(self, model, device, entry: SpecDecEvalEntry) -> dict[str, float]:
+    def _run(self, model, device, entry: SpecDecEvalEntry, batch_size: int = 1, seed: int = 0) -> dict[str, float]:
         d, n = entry.d_tokens, entry.n_drafts
-
-        pos_avg:          list[list[float]] = [[] for _ in range(d)]
-        pos_best:         list[list[float]] = [[] for _ in range(d)]
-        think_pos_avg:    list[list[float]] = [[] for _ in range(d)]
-        think_pos_best:   list[list[float]] = [[] for _ in range(d)]
-        nothink_pos_avg:  list[list[float]] = [[] for _ in range(d)]
-        nothink_pos_best: list[list[float]] = [[] for _ in range(d)]
-
+        tokenizer = self.tokenizer
         n_samples = len(entry.eval_samples)
 
-        for i, sample in enumerate(entry.eval_samples):
+        # Per-step records: (i, j, step, in_think, k_values). Metrics are aggregated
+        # from these afterwards in a fixed (i, j, step) order, so the result does not
+        # depend on the order in which concurrently-batched samples complete.
+        records: list[tuple[int, int, int, bool, list[int]]] = []
+
+        pbar = tqdm(total=n_samples, desc=f"[{entry.name}]", unit="sample", leave=False)
+
+        # --- Async batcher -------------------------------------------------
+        # Each sample runs as a coroutine. When it needs drafts it parks on a
+        # future; once `batch_size` requests are pending (or every still-active
+        # sample is parked) the queued requests are decoded together in one call.
+        pending: list[tuple[dict, asyncio.Future]] = []
+        active = {"n": 0}
+
+        def _flush(k: int) -> None:
+            batch = pending[:k]
+            del pending[:k]
+            outs = _draft_batch(model, tokenizer, [r for r, _ in batch], device)
+            for (_, fut), res in zip(batch, outs):
+                fut.set_result(res)
+
+        def _maybe_flush() -> None:
+            while len(pending) >= batch_size:
+                _flush(batch_size)
+            # Tail: when no further requests can arrive (every active sample is
+            # already parked here), decode the short batch instead of deadlocking.
+            if active["n"] > 0 and pending and len(pending) >= active["n"]:
+                _flush(len(pending))
+
+        async def _draft(context: str, i: int, j: int, step: int) -> list[list[int]]:
+            fut = asyncio.get_running_loop().create_future()
+            req = {
+                "context_ids": tokenizer(context).input_ids,
+                "n": n,
+                "d": d,
+                "temperature": entry.temperature,
+                "seed": _request_seed(seed, i, j, step),
+            }
+            pending.append((req, fut))
+            _maybe_flush()
+            return await fut
+
+        async def _process(i: int, sample: dict) -> None:
             messages = sample.get("messages") or sample.get("conversations") or []
             if not messages:
-                continue
+                return
 
             # convert GLM-style <think> blocks to Qwen3 if needed
             tools = _tools_from_sample(sample)
@@ -558,13 +689,7 @@ class SpeculativeAcceptanceCallback(TrainerCallback):
                 if m["role"] == "assistant":
                     m["content"] = _qwen3_convert_glm_think_blocks(m["content"])
 
-            turns = _assistant_turns(messages, self.tokenizer, tools=tools)
-            n_turns = len(turns)
-            pbar_total = sum(len(target) for _, target, _ in turns)
-            if entry.max_characters is not None:
-                pbar_total = min(pbar_total, entry.max_characters)
-            pbar = tqdm(total=pbar_total, desc=f"[{entry.name}] sample {i + 1}/{n_samples} turn 1/{n_turns}", unit="char", leave=False)
-
+            turns = _assistant_turns(messages, tokenizer, tools=tools)
             chars_consumed = 0
             budget_exhausted = False
 
@@ -573,14 +698,11 @@ class SpeculativeAcceptanceCallback(TrainerCallback):
                     break
 
                 # Parity check: prompt + target_text must be a prefix of the fully-templated turn.
-                full = self.tokenizer.apply_chat_template(turn_messages, tools=tools, tokenize=False)
-                reconstructed = prompt + target_text
-                if not full.startswith(reconstructed):
+                full = tokenizer.apply_chat_template(turn_messages, tools=tools, tokenize=False)
+                if not full.startswith(prompt + target_text):
                     logger.error("prompt+target is not a prefix of full template")
-                    pbar.close()
                     raise ValueError("Prompt/target reconstruction failed parity check")
 
-                pbar.set_description(f"[{entry.name}] sample {i + 1}/{n_samples} turn {j + 1}/{n_turns}")
                 accepted_char_pos = 0
 
                 _think_sentinel = "</think>\n\n"
@@ -589,7 +711,7 @@ class SpeculativeAcceptanceCallback(TrainerCallback):
                     if _think_sentinel in target_text else 0
                 )
 
-                for _ in range(128_000):  # hard cap on iterations per turn
+                for step in range(128_000):  # hard cap on iterations per turn
                     remaining = target_text[accepted_char_pos:]
                     if not remaining.strip():
                         break
@@ -600,47 +722,69 @@ class SpeculativeAcceptanceCallback(TrainerCallback):
                     in_think = accepted_char_pos < think_end_idx
 
                     context = prompt + target_text[:accepted_char_pos]
-                    all_ids = _draft_completions(model, self.tokenizer, context, n, d, entry.temperature, device)
+                    all_ids = await _draft(context, i, j, step)
 
-                    results   = [_accepted_tokens(ids, remaining, self.tokenizer) for ids in all_ids]
+                    results   = [_accepted_tokens(ids, remaining, tokenizer) for ids in all_ids]
                     k_values  = [r[0] for r in results]
+                    records.append((i, j, step, in_think, k_values))
 
                     best_k   = max(k_values)
                     best_idx = k_values.index(best_k)
 
-                    for pos in range(d):
-                        avg_val  = sum(1 for k in k_values if k > pos) / n
-                        best_val = 1.0 if best_k > pos else 0.0
-                        pos_avg[pos].append(avg_val)
-                        pos_best[pos].append(best_val)
-                        if in_think:
-                            think_pos_avg[pos].append(avg_val)
-                            think_pos_best[pos].append(best_val)
-                        else:
-                            nothink_pos_avg[pos].append(avg_val)
-                            nothink_pos_best[pos].append(best_val)
-
                     # advance to next fully accepted token boundary of best draft proposal
-                    best_lcp = len(self.tokenizer.decode(all_ids[best_idx][:best_k]))
+                    best_lcp = len(tokenizer.decode(all_ids[best_idx][:best_k]))
                     if best_lcp > 0:
                         accepted_char_pos += best_lcp
                         chars_consumed += best_lcp
-                        pbar.update(best_lcp)
                     else:
                         # Nothing matched — advance by minimum number of draft tokens that will
                         # get us to next clean utf-8 boundary in decoded text
                         skip_token_cnt = 0
                         skip_prefix = ""
-                        remaining_ids = self.tokenizer.encode(remaining[:50])
+                        remaining_ids = tokenizer.encode(remaining[:50])
                         while skip_token_cnt == 0 or remaining[:len(skip_prefix)] != skip_prefix:
                             skip_token_cnt += 1
-                            skip_prefix = self.tokenizer.decode(remaining_ids[:skip_token_cnt])
+                            skip_prefix = tokenizer.decode(remaining_ids[:skip_token_cnt])
 
                         accepted_char_pos += len(skip_prefix)
                         chars_consumed += len(skip_prefix)
-                        pbar.update(len(skip_prefix))
 
-            pbar.close()
+        async def _worker(i: int, sample: dict) -> None:
+            try:
+                await _process(i, sample)
+            finally:
+                active["n"] -= 1
+                pbar.update(1)
+                _maybe_flush()
+
+        async def _driver() -> None:
+            active["n"] = n_samples
+            await asyncio.gather(*[_worker(i, s) for i, s in enumerate(entry.eval_samples)])
+
+        asyncio.run(_driver())
+        pbar.close()
+
+        # --- Aggregate metrics in deterministic (i, j, step) order ---------
+        pos_avg:          list[list[float]] = [[] for _ in range(d)]
+        pos_best:         list[list[float]] = [[] for _ in range(d)]
+        think_pos_avg:    list[list[float]] = [[] for _ in range(d)]
+        think_pos_best:   list[list[float]] = [[] for _ in range(d)]
+        nothink_pos_avg:  list[list[float]] = [[] for _ in range(d)]
+        nothink_pos_best: list[list[float]] = [[] for _ in range(d)]
+
+        for i, j, step, in_think, k_values in sorted(records, key=lambda r: (r[0], r[1], r[2])):
+            best_k = max(k_values)
+            for pos in range(d):
+                avg_val  = sum(1 for k in k_values if k > pos) / n
+                best_val = 1.0 if best_k > pos else 0.0
+                pos_avg[pos].append(avg_val)
+                pos_best[pos].append(best_val)
+                if in_think:
+                    think_pos_avg[pos].append(avg_val)
+                    think_pos_best[pos].append(best_val)
+                else:
+                    nothink_pos_avg[pos].append(avg_val)
+                    nothink_pos_best[pos].append(best_val)
 
         out: dict[str, float] = {}
         for pos in range(d):

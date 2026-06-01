@@ -330,6 +330,7 @@ def main(script_args, training_args, model_args, dataset_args, spec_dec_args):
         tokenizer=tokenizer,
         eval_entries=eval_entries,
         full_eval_entries=full_eval_entries,
+        batch_size=spec_dec_args.spec_dec_batch_size,
     )]
 
     # ------------------------------------------------------------------
