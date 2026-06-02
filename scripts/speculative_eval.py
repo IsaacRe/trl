@@ -476,20 +476,26 @@ class SpeculativeAcceptanceCallback(TrainerCallback):
 
         all_metrics: dict[str, float] = {}
         try:
-            for entry in full_eval_entries:
+            # Each phase pools its samples across all its datasets into one set,
+            # shards that set across ranks, and aggregates back per dataset — so every
+            # rank stays busy even when an individual dataset has fewer samples than
+            # there are GPUs (total samples across datasets only needs to reach world_size).
+            if full_eval_entries:
                 if is_main:
-                    logger.warning("Running full eval on %d samples [%s]…", len(entry.eval_samples), entry.name)
+                    names = ", ".join(f"{e.name}×{len(e.eval_samples)}" for e in full_eval_entries)
+                    logger.warning("Running full eval on [%s]…", names)
                 try:
-                    all_metrics.update(self._run_full_eval(model, device, entry))
+                    all_metrics.update(self._run_full_eval(model, device, full_eval_entries))
                 except Exception:
-                    logger.exception("Full eval failed for entry %s", entry.name)
-            for entry in spec_dec_entries:
+                    logger.exception("Full eval failed")
+            if spec_dec_entries:
                 if is_main:
-                    logger.warning("Running spec dec eval on %d samples [%s]…", len(entry.eval_samples), entry.name)
+                    names = ", ".join(f"{e.name}×{len(e.eval_samples)}" for e in spec_dec_entries)
+                    logger.warning("Running spec dec eval on [%s]…", names)
                 try:
-                    all_metrics.update(self._run(model, device, entry, batch_size=self.batch_size, seed=args.seed))
+                    all_metrics.update(self._run(model, device, spec_dec_entries, batch_size=self.batch_size, seed=args.seed))
                 except Exception:
-                    logger.exception("Spec dec eval failed for entry %s", entry.name)
+                    logger.exception("Spec dec eval failed")
         finally:
             if was_training:
                 model.train()
@@ -501,7 +507,7 @@ class SpeculativeAcceptanceCallback(TrainerCallback):
                 if wandb.run is not None:
                     wandb.log({**all_metrics, "train/global_step": state.global_step})
 
-    def _run_full_eval(self, model, device, entry: FullEvalEntry) -> dict[str, float]:
+    def _run_full_eval(self, model, device, entries: list[FullEvalEntry]) -> dict[str, float]:
         """
         Evaluate next-token accuracy on every assistant turn in each sample.
 
@@ -509,16 +515,19 @@ class SpeculativeAcceptanceCallback(TrainerCallback):
         for that turn's full prefix (all prior turns, with reasoning stripped by
         the chat template) and discarded between turns.
 
-        Under DDP each rank evaluates its shard of the samples; the per-rank token
-        counts are summed across ranks below before the accuracy ratios are formed.
+        Samples from every dataset are pooled into one set and sharded across ranks
+        (`pool[rank::world_size]`), so all GPUs stay busy regardless of how samples
+        are split between datasets. Per-dataset token counts are then summed across
+        ranks before the accuracy ratios are formed.
         """
-        total_correct = total_tokens = 0
-        think_correct = think_tokens = 0
-        nothink_correct = nothink_tokens = 0
         chunk_size = 2048
+        # Per-dataset accumulators, keyed by dataset name:
+        # [correct, tokens, think_correct, think_tokens, nothink_correct, nothink_tokens].
+        counts = {entry.name: [0, 0, 0, 0, 0, 0] for entry in entries}
 
         state = PartialState()
-        for sample in entry.eval_samples[state.process_index :: state.num_processes]:
+        pool = [(entry, sample) for entry in entries for sample in entry.eval_samples]
+        for entry, sample in pool[state.process_index :: state.num_processes]:
             messages = sample.get("messages") or sample.get("conversations") or []
             if not messages:
                 continue
@@ -526,6 +535,7 @@ class SpeculativeAcceptanceCallback(TrainerCallback):
             for m in messages:
                 if m["role"] == "assistant":
                     m["content"] = _qwen3_convert_glm_think_blocks(m["content"])
+            acc = counts[entry.name]
 
             asst_indices = [i for i, m in enumerate(messages) if m["role"] == "assistant"]
             for asst_idx in asst_indices:
@@ -567,32 +577,28 @@ class SpeculativeAcceptanceCallback(TrainerCallback):
                         lbl_mask = lbls != -100
                         correct  = (preds == lbls) & lbl_mask
 
-                        total_correct   += correct.sum().item()
-                        total_tokens    += lbl_mask.sum().item()
-                        think_correct   += (correct &  tmask).sum().item()
-                        think_tokens    += (lbl_mask &  tmask).sum().item()
-                        nothink_correct += (correct & ~tmask).sum().item()
-                        nothink_tokens  += (lbl_mask & ~tmask).sum().item()
+                        acc[0] += correct.sum().item()
+                        acc[1] += lbl_mask.sum().item()
+                        acc[2] += (correct &  tmask).sum().item()
+                        acc[3] += (lbl_mask &  tmask).sum().item()
+                        acc[4] += (correct & ~tmask).sum().item()
+                        acc[5] += (lbl_mask & ~tmask).sum().item()
                     del out
                 del past_key_values
 
-        # Sum the per-rank count accumulators into a global total. Every rank reaches
+        # Sum each dataset's per-rank accumulators into global totals. Every rank reaches
         # this gather — even one whose shard was empty — so it cannot deadlock.
-        counts = gather_object(
-            [(total_correct, total_tokens, think_correct, think_tokens, nothink_correct, nothink_tokens)]
-        )
-        total_correct, total_tokens   = sum(c[0] for c in counts), sum(c[1] for c in counts)
-        think_correct, think_tokens   = sum(c[2] for c in counts), sum(c[3] for c in counts)
-        nothink_correct, nothink_tokens = sum(c[4] for c in counts), sum(c[5] for c in counts)
-
-        if total_tokens == 0:
-            return {}
-
-        result = {f"full_eval/{entry.name}/mean_token_accuracy": total_correct / total_tokens}
-        if think_tokens > 0:
-            result[f"full_eval/{entry.name}/mean_token_accuracy_think"]   = think_correct / think_tokens
-        if nothink_tokens > 0:
-            result[f"full_eval/{entry.name}/mean_token_accuracy_nothink"] = nothink_correct / nothink_tokens
+        gathered = gather_object([counts])
+        result: dict[str, float] = {}
+        for entry in entries:
+            tc, tt, thc, tht, ntc, ntt = (sum(c[entry.name][k] for c in gathered) for k in range(6))
+            if tt == 0:
+                continue
+            result[f"full_eval/{entry.name}/mean_token_accuracy"] = tc / tt
+            if tht > 0:
+                result[f"full_eval/{entry.name}/mean_token_accuracy_think"]   = thc / tht
+            if ntt > 0:
+                result[f"full_eval/{entry.name}/mean_token_accuracy_nothink"] = ntc / ntt
         return result
 
     def _run_full_eval_with_caching(self, model, device, entry: FullEvalEntry) -> dict[str, float]:
@@ -731,52 +737,69 @@ class SpeculativeAcceptanceCallback(TrainerCallback):
             result[f"full_eval/{entry.name}/mean_token_accuracy_nothink"] = nothink_correct / nothink_tokens
         return result
 
-    def _run(self, model, device, entry: SpecDecEvalEntry, batch_size: int = 1, seed: int = 0) -> dict[str, float]:
-        d, n = entry.d_tokens, entry.n_drafts
+    def _run(self, model, device, entries: list[SpecDecEvalEntry], batch_size: int = 1, seed: int = 0) -> dict[str, float]:
         tokenizer = self.tokenizer
-        # Under DDP each rank drafts on its shard of the samples, keeping each sample's
-        # global index so the per-request RNG seed (and thus the sampled drafts) is
-        # independent of how samples are split across ranks. Records are gathered below.
-        state = PartialState()
-        local_samples = list(enumerate(entry.eval_samples))[state.process_index :: state.num_processes]
-        n_local = len(local_samples)
         # Sample drafts the way the model actually generates: temperature comes from
-        # the entry, but top-k / top-p are taken from the model's generation config.
+        # each entry, but top-k / top-p are taken from the model's generation config.
         top_k = model.generation_config.top_k
         top_p = model.generation_config.top_p
 
-        # Per-step records: (i, j, step, in_think, k_values). Metrics are aggregated
+        # Pool every (dataset, sample) pair into one work set and shard it across ranks.
+        # Each sample keeps its index within its own dataset, so the per-request RNG seed
+        # (and thus the sampled drafts) is independent of how the pool is split — pooling
+        # never changes a dataset's metrics versus running it alone. Records are tagged
+        # with the dataset name and gathered below.
+        state = PartialState()
+        pool = [(entry, i, sample) for entry in entries for i, sample in enumerate(entry.eval_samples)]
+        local_work = pool[state.process_index :: state.num_processes]
+
+        # Per-step records: (name, i, j, step, in_think, k_values). Metrics are aggregated
         # from these afterwards in a fixed (i, j, step) order, so the result does not
         # depend on the order in which concurrently-batched samples complete.
-        records: list[tuple[int, int, int, bool, list[int]]] = []
+        records: list[tuple[str, int, int, int, bool, list[int]]] = []
 
-        pbar = tqdm(total=n_local, desc=f"[{entry.name}]", unit="sample", leave=False,
+        pbar = tqdm(total=len(local_work), desc="[spec-dec]", unit="sample", leave=False,
                     disable=not state.is_main_process)
 
         # --- Async batcher -------------------------------------------------
-        # Each sample runs as a coroutine. When it needs drafts it parks on a
-        # future; once `batch_size` requests are pending (or every still-active
-        # sample is parked) the queued requests are decoded together in one call.
+        # Each sample runs as a coroutine. When it needs drafts it parks on a future;
+        # parked requests are decoded together once a same-(n_drafts, d_tokens) group
+        # reaches `batch_size` (or every still-active sample is parked). A single decode
+        # batch must be uniform in (n, d), so requests are grouped by it before flushing.
         pending: list[tuple[dict, asyncio.Future]] = []
         active = {"n": 0}
         total_chars = {"n": 0}  # characters processed across all samples, shown live in the pbar
 
-        def _flush(k: int) -> None:
-            batch = pending[:k]
-            del pending[:k]
+        def _flush(batch: list[tuple[dict, asyncio.Future]]) -> None:
             outs = _draft_from_caches(model, tokenizer, [r for r, _ in batch], device)
             for (_, fut), res in zip(batch, outs):
                 fut.set_result(res)
 
         def _maybe_flush() -> None:
-            while len(pending) >= batch_size:
-                _flush(batch_size)
-            # Tail: when no further requests can arrive (every active sample is
-            # already parked here), decode the short batch instead of deadlocking.
+            # Flush any (n, d) group that has reached batch_size.
+            while True:
+                groups: dict[tuple[int, int], list[int]] = {}
+                for idx, (req, _) in enumerate(pending):
+                    groups.setdefault((req["n"], req["d"]), []).append(idx)
+                ready = next((idxs for idxs in groups.values() if len(idxs) >= batch_size), None)
+                if ready is None:
+                    break
+                sel = set(ready[:batch_size])
+                batch = [pending[i] for i in ready[:batch_size]]
+                pending[:] = [p for k, p in enumerate(pending) if k not in sel]
+                _flush(batch)
+            # Tail: when no further requests can arrive (every still-active sample is
+            # already parked), decode whatever remains — still grouped by (n, d) so each
+            # batch stays uniform — instead of deadlocking.
             if active["n"] > 0 and pending and len(pending) >= active["n"]:
-                _flush(len(pending))
+                groups: dict[tuple[int, int], list[tuple[dict, asyncio.Future]]] = {}
+                for req, fut in pending:
+                    groups.setdefault((req["n"], req["d"]), []).append((req, fut))
+                pending.clear()
+                for batch in groups.values():
+                    _flush(batch)
 
-        async def _draft(kv, next_logits, committed_len: int, i: int, j: int, step: int) -> list[list[int]]:
+        async def _draft(kv, next_logits, committed_len, i, j, step, n, d, temperature) -> list[list[int]]:
             fut = asyncio.get_running_loop().create_future()
             req = {
                 "kv": kv,
@@ -784,7 +807,7 @@ class SpeculativeAcceptanceCallback(TrainerCallback):
                 "committed_len": committed_len,
                 "n": n,
                 "d": d,
-                "temperature": entry.temperature,
+                "temperature": temperature,
                 "top_k": top_k,
                 "top_p": top_p,
                 "seed": _request_seed(seed, i, j, step),
@@ -793,7 +816,7 @@ class SpeculativeAcceptanceCallback(TrainerCallback):
             _maybe_flush()
             return await fut
 
-        async def _process(i: int, sample: dict) -> None:
+        async def _process(entry: SpecDecEvalEntry, i: int, sample: dict) -> None:
             messages = sample.get("messages") or sample.get("conversations") or []
             if not messages:
                 return
@@ -844,11 +867,12 @@ class SpeculativeAcceptanceCallback(TrainerCallback):
 
                     in_think = accepted_char_pos < think_end_idx
 
-                    all_ids = await _draft(kv, next_logits, len(committed_ids), i, j, step)
+                    all_ids = await _draft(kv, next_logits, len(committed_ids), i, j, step,
+                                           entry.n_drafts, entry.d_tokens, entry.temperature)
 
                     results   = [_accepted_tokens(ids, remaining, tokenizer) for ids in all_ids]
                     k_values  = [r[0] for r in results]
-                    records.append((i, j, step, in_think, k_values))
+                    records.append((entry.name, i, j, step, in_think, k_values))
 
                     best_k   = max(k_values)
                     best_idx = k_values.index(best_k)
@@ -887,58 +911,62 @@ class SpeculativeAcceptanceCallback(TrainerCallback):
                             next_logits, kv = _forward_extend(model, kv, new_committed[P:], P, device)
                         committed_ids = new_committed
 
-        async def _worker(i: int, sample: dict) -> None:
+        async def _worker(entry: SpecDecEvalEntry, i: int, sample: dict) -> None:
             try:
-                await _process(i, sample)
+                await _process(entry, i, sample)
             finally:
                 active["n"] -= 1
                 pbar.update(1)
                 _maybe_flush()
 
         async def _driver() -> None:
-            active["n"] = n_local
-            await asyncio.gather(*[_worker(i, s) for i, s in local_samples])
+            active["n"] = len(local_work)
+            await asyncio.gather(*[_worker(entry, i, s) for entry, i, s in local_work])
 
         asyncio.run(_driver())
         pbar.close()
 
         # Gather every rank's per-step records onto all ranks (each rank reaches this
         # call even with an empty shard, so it cannot deadlock). Metrics below are then
-        # aggregated identically on every rank in a fixed (i, j, step) order, and the
-        # caller logs them on the main process only.
+        # aggregated identically on every rank, per dataset, in a fixed (i, j, step) order;
+        # the caller logs them on the main process only.
         records = gather_object(records)
-
-        # --- Aggregate metrics in deterministic (i, j, step) order ---------
-        pos_avg:          list[list[float]] = [[] for _ in range(d)]
-        pos_best:         list[list[float]] = [[] for _ in range(d)]
-        think_pos_avg:    list[list[float]] = [[] for _ in range(d)]
-        think_pos_best:   list[list[float]] = [[] for _ in range(d)]
-        nothink_pos_avg:  list[list[float]] = [[] for _ in range(d)]
-        nothink_pos_best: list[list[float]] = [[] for _ in range(d)]
-
-        for i, j, step, in_think, k_values in sorted(records, key=lambda r: (r[0], r[1], r[2])):
-            best_k = max(k_values)
-            for pos in range(d):
-                avg_val  = sum(1 for k in k_values if k > pos) / n
-                best_val = 1.0 if best_k > pos else 0.0
-                pos_avg[pos].append(avg_val)
-                pos_best[pos].append(best_val)
-                if in_think:
-                    think_pos_avg[pos].append(avg_val)
-                    think_pos_best[pos].append(best_val)
-                else:
-                    nothink_pos_avg[pos].append(avg_val)
-                    nothink_pos_best[pos].append(best_val)
+        by_name: dict[str, list[tuple]] = {}
+        for rec in records:
+            by_name.setdefault(rec[0], []).append(rec)
 
         out: dict[str, float] = {}
-        for pos in range(d):
-            if pos_avg[pos]:
-                out[f"spec_acc/{entry.name}/avg@{n}_pos{pos + 1}"]  = sum(pos_avg[pos])  / len(pos_avg[pos])
-                out[f"spec_acc/{entry.name}/best@{n}_pos{pos + 1}"] = sum(pos_best[pos]) / len(pos_best[pos])
-            if think_pos_avg[pos]:
-                out[f"spec_acc/{entry.name}/avg@{n}_pos{pos + 1}_think"]  = sum(think_pos_avg[pos])  / len(think_pos_avg[pos])
-                out[f"spec_acc/{entry.name}/best@{n}_pos{pos + 1}_think"] = sum(think_pos_best[pos]) / len(think_pos_best[pos])
-            if nothink_pos_avg[pos]:
-                out[f"spec_acc/{entry.name}/avg@{n}_pos{pos + 1}_nothink"]  = sum(nothink_pos_avg[pos])  / len(nothink_pos_avg[pos])
-                out[f"spec_acc/{entry.name}/best@{n}_pos{pos + 1}_nothink"] = sum(nothink_pos_best[pos]) / len(nothink_pos_best[pos])
+        for entry in entries:
+            d, n = entry.d_tokens, entry.n_drafts
+            pos_avg:          list[list[float]] = [[] for _ in range(d)]
+            pos_best:         list[list[float]] = [[] for _ in range(d)]
+            think_pos_avg:    list[list[float]] = [[] for _ in range(d)]
+            think_pos_best:   list[list[float]] = [[] for _ in range(d)]
+            nothink_pos_avg:  list[list[float]] = [[] for _ in range(d)]
+            nothink_pos_best: list[list[float]] = [[] for _ in range(d)]
+
+            for name, i, j, step, in_think, k_values in sorted(by_name.get(entry.name, []), key=lambda r: (r[1], r[2], r[3])):
+                best_k = max(k_values)
+                for pos in range(d):
+                    avg_val  = sum(1 for k in k_values if k > pos) / n
+                    best_val = 1.0 if best_k > pos else 0.0
+                    pos_avg[pos].append(avg_val)
+                    pos_best[pos].append(best_val)
+                    if in_think:
+                        think_pos_avg[pos].append(avg_val)
+                        think_pos_best[pos].append(best_val)
+                    else:
+                        nothink_pos_avg[pos].append(avg_val)
+                        nothink_pos_best[pos].append(best_val)
+
+            for pos in range(d):
+                if pos_avg[pos]:
+                    out[f"spec_acc/{entry.name}/avg@{n}_pos{pos + 1}"]  = sum(pos_avg[pos])  / len(pos_avg[pos])
+                    out[f"spec_acc/{entry.name}/best@{n}_pos{pos + 1}"] = sum(pos_best[pos]) / len(pos_best[pos])
+                if think_pos_avg[pos]:
+                    out[f"spec_acc/{entry.name}/avg@{n}_pos{pos + 1}_think"]  = sum(think_pos_avg[pos])  / len(think_pos_avg[pos])
+                    out[f"spec_acc/{entry.name}/best@{n}_pos{pos + 1}_think"] = sum(think_pos_best[pos]) / len(think_pos_best[pos])
+                if nothink_pos_avg[pos]:
+                    out[f"spec_acc/{entry.name}/avg@{n}_pos{pos + 1}_nothink"]  = sum(nothink_pos_avg[pos])  / len(nothink_pos_avg[pos])
+                    out[f"spec_acc/{entry.name}/best@{n}_pos{pos + 1}_nothink"] = sum(nothink_pos_best[pos]) / len(nothink_pos_best[pos])
         return out
