@@ -1,0 +1,105 @@
+# LoRA fine-tuning: Qwen3-32B on Jackrong/Kimi-K2.5-Reasoning-1M-Cleaned (General-Distillation)
+# Rank-256 LoRA on q_proj, k_proj, v_proj, o_proj only (same LoRA config as Qwen3-1.7B).
+#
+# 4×H200 DDP run (replicate the 61 GB model per GPU; effective batch
+# 2 × accum 8 × 4 GPUs = 64). Launch with:
+#   accelerate launch --config_file examples/accelerate_configs/multi_gpu.yaml \
+#     --num_processes 4 scripts/train_sft.py \
+#     --config configs/Qwen3-32B/Kimi-K2.5-Reasoning-1M-Cleaned/4xH200/sft_lora.yaml
+
+# Dataset — single source, wrapped in `interleave_datasets` so `skip_samples`
+# applies: the first 50 rows are held out from training and used for eval below.
+dataset_train_split: train
+dataset_streaming: true
+interleave_datasets:
+  - path: Jackrong/GLM-5.1-Reasoning-1M-Cleaned
+    name: main
+    streaming: true    # 100K–1M rows, stays streamed
+    skip_samples: 50
+
+# Model
+model_name_or_path: Qwen/Qwen3-32B
+dtype: bfloat16
+attn_implementation: sdpa
+
+# PEFT / LoRA
+use_peft: true
+lora_r: 256
+lora_alpha: 256
+lora_dropout: 0.05
+lora_target_modules:
+  - q_proj
+  - k_proj
+  - v_proj
+  - o_proj
+
+# Output
+output_dir: ""
+run_name: glm_reasoning_sft
+
+# Training hyperparameters
+max_steps: 10_000
+per_device_train_batch_size: 4
+gradient_accumulation_steps: 4
+learning_rate: 2.0e-4
+lr_scheduler_type: cosine
+warmup_ratio: 0.05
+weight_decay: 0.01
+
+# Sequence length
+max_length: 12_000
+packing: false
+
+# Precision & memory
+bf16: true
+gradient_checkpointing: true
+gradient_checkpointing_kwargs:
+  use_reentrant: false
+# Fused linear cross-entropy — avoids materializing the full-vocab logits
+# (~5GB/step on this 152k-vocab model), required to fit 32B + r256 LoRA in 97GB.
+use_liger_kernel: true
+
+# Loss mode — pick ONE:
+#   assistant_only_loss: true   trains on ALL assistant turns (intermediate turns
+#                               have reasoning stripped by the Qwen3 template;
+#                               final turn retains its <think> block)
+#   completion_only_loss: true   trains ONLY on the sampled final assistant turn
+#                               (with reasoning); uses prompt-completion format
+assistant_only_loss: true
+# completion_only_loss: true
+
+# Logging & evaluation
+logging_steps: 1
+eval_strategy: "no"
+save_strategy: steps
+save_steps: 500
+# save_total_limit: 1
+
+# Misc
+dataloader_num_workers: 1
+
+# Full forward-pass eval (loss, token accuracy, entropy)
+full_eval:
+  eval_steps: 10
+  datasets:
+    # First 50 rows of Jackrong — the samples skipped during training.
+    - dataset: Jackrong/GLM-5.1-Reasoning-1M-Cleaned
+      dataset_config: main
+      name: reasoning-heldout
+      n_samples: 10
+      max_length: 12_000
+
+spec_dec_batch_size: 1
+baseline_eval_on_start: true
+spec_dec_eval:
+  eval_steps: 50
+  datasets:
+  # First 50 rows of Jackrong — the samples skipped during training.
+    - dataset: Jackrong/GLM-5.1-Reasoning-1M-Cleaned
+      dataset_config: main
+      name: reasoning-heldout
+      n_samples: 4
+      n_drafts: 1
+      d_tokens: 16
+      temperature: 0.6
+      max_characters: 3_500
