@@ -22,6 +22,7 @@ All positions k are 1-indexed relative to the start of each draft iteration.
 
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import dataclass, field
 import re
@@ -93,7 +94,19 @@ def _qwen3_open_think_block(prompt: str) -> str:
     return prompt
 
 
-def _build_sequence_with_labels(messages: list[dict], tokenizer) -> tuple[list[int], list[int], list[bool]]:
+def _tools_from_sample(sample: dict):
+    """Tool schemas for the chat template, or ``None``.
+
+    Mirrors TRL's ``SFTTrainer`` tokenize path: a ``tools`` column is either a
+    list of JSON schemas or a JSON string encoding that list.
+    """
+    tools = sample.get("tools")
+    return json.loads(tools) if isinstance(tools, str) else tools
+
+
+def _build_sequence_with_labels(
+    messages: list[dict], tokenizer, tools=None
+) -> tuple[list[int], list[int], list[bool]]:
     """
     Tokenize the full conversation and return ``(input_ids, labels, think_mask)``.
 
@@ -108,13 +121,13 @@ def _build_sequence_with_labels(messages: list[dict], tokenizer) -> tuple[list[i
     if not messages or messages[-1]["role"] != "assistant":
         raise ValueError("last message must be an assistant message")
 
-    full_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
+    full_text = tokenizer.apply_chat_template(messages, tools=tools, tokenize=False, add_generation_prompt=False)
     full_ids = tokenizer.encode(full_text)
     labels = [-100] * len(full_ids)
     think_mask = [False] * len(full_ids)
 
     context_text = tokenizer.apply_chat_template(
-        messages[:-1], tokenize=False, add_generation_prompt=True
+        messages[:-1], tools=tools, tokenize=False, add_generation_prompt=True
     )
     n_context = len(tokenizer.encode(context_text))
 
@@ -136,7 +149,7 @@ def _build_sequence_with_labels(messages: list[dict], tokenizer) -> tuple[list[i
     return full_ids, labels, think_mask
 
 
-def _assistant_turns(messages: list[dict], tokenizer) -> list[tuple[str, str, list[dict]]]:
+def _assistant_turns(messages: list[dict], tokenizer, tools=None) -> list[tuple[str, str, list[dict]]]:
     """
     Return ``(context, target, turn_messages)`` for every assistant turn.
 
@@ -156,7 +169,7 @@ def _assistant_turns(messages: list[dict], tokenizer) -> list[tuple[str, str, li
         if not target.strip():
             continue
         context = tokenizer.apply_chat_template(
-            messages[:i], tokenize=False, add_generation_prompt=True, enable_thinking=True
+            messages[:i], tools=tools, tokenize=False, add_generation_prompt=True, enable_thinking=True
         )
         context = _qwen3_open_think_block(context)
         turns.append((context, target, messages[:i + 1]))
@@ -322,6 +335,7 @@ class SpeculativeAcceptanceCallback(TrainerCallback):
             messages = sample.get("messages") or sample.get("conversations") or []
             if not messages:
                 continue
+            tools = _tools_from_sample(sample)
             for m in messages:
                 if m["role"] == "assistant":
                     m["content"] = _qwen3_convert_glm_think_blocks(m["content"])
@@ -331,7 +345,7 @@ class SpeculativeAcceptanceCallback(TrainerCallback):
                 turn_messages = messages[:asst_idx + 1]
                 try:
                     input_ids, label_ids, think_mask = _build_sequence_with_labels(
-                        turn_messages, self.tokenizer
+                        turn_messages, self.tokenizer, tools=tools
                     )
                 except ValueError:
                     continue
@@ -408,6 +422,7 @@ class SpeculativeAcceptanceCallback(TrainerCallback):
             messages = sample.get("messages") or sample.get("conversations") or []
             if not messages:
                 continue
+            tools = _tools_from_sample(sample)
             for m in messages:
                 if m["role"] == "assistant":
                     m["content"] = _qwen3_convert_glm_think_blocks(m["content"])
@@ -420,7 +435,7 @@ class SpeculativeAcceptanceCallback(TrainerCallback):
                 turn_messages = messages[:asst_idx + 1]
                 try:
                     input_ids, label_ids, think_mask = _build_sequence_with_labels(
-                        turn_messages, self.tokenizer
+                        turn_messages, self.tokenizer, tools=tools
                     )
                 except ValueError:
                     prefix_kv  = None
@@ -493,7 +508,7 @@ class SpeculativeAcceptanceCallback(TrainerCallback):
                 if next_turn < len(asst_indices):
                     next_asst_idx  = asst_indices[next_turn]
                     next_ctx_text  = self.tokenizer.apply_chat_template(
-                        messages[:next_asst_idx], tokenize=False, add_generation_prompt=True
+                        messages[:next_asst_idx], tools=tools, tokenize=False, add_generation_prompt=True
                     )
                     next_ctx_ids = self.tokenizer.encode(next_ctx_text)
                     if len(next_ctx_ids) > prefix_len:
@@ -538,11 +553,12 @@ class SpeculativeAcceptanceCallback(TrainerCallback):
                 continue
 
             # convert GLM-style <think> blocks to Qwen3 if needed
+            tools = _tools_from_sample(sample)
             for m in messages:
                 if m["role"] == "assistant":
                     m["content"] = _qwen3_convert_glm_think_blocks(m["content"])
 
-            turns = _assistant_turns(messages, self.tokenizer)
+            turns = _assistant_turns(messages, self.tokenizer, tools=tools)
             n_turns = len(turns)
             pbar_total = sum(len(target) for _, target, _ in turns)
             if entry.max_characters is not None:
@@ -557,7 +573,7 @@ class SpeculativeAcceptanceCallback(TrainerCallback):
                     break
 
                 # Parity check: prompt + target_text must be a prefix of the fully-templated turn.
-                full = self.tokenizer.apply_chat_template(turn_messages, tokenize=False)
+                full = self.tokenizer.apply_chat_template(turn_messages, tools=tools, tokenize=False)
                 reconstructed = prompt + target_text
                 if not full.startswith(reconstructed):
                     logger.error("prompt+target is not a prefix of full template")

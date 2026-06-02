@@ -11,6 +11,7 @@ Usage:
 
 import dataclasses
 import itertools
+import json
 import logging
 import os
 import random
@@ -134,8 +135,11 @@ def _to_prompt_completion(example, tokenizer) -> dict:
     msgs = example.get("messages") or []
     if not msgs or msgs[-1].get("role") != "assistant":
         return example
-    full_text   = tokenizer.apply_chat_template(msgs,      tokenize=False, add_generation_prompt=False)
-    prompt_text = tokenizer.apply_chat_template(msgs[:-1], tokenize=False, add_generation_prompt=True)
+    # `tools` column is a list of JSON schemas or a JSON string encoding that list.
+    tools = example.get("tools")
+    tools = json.loads(tools) if isinstance(tools, str) else tools
+    full_text   = tokenizer.apply_chat_template(msgs,      tools=tools, tokenize=False, add_generation_prompt=False)
+    prompt_text = tokenizer.apply_chat_template(msgs[:-1], tools=tools, tokenize=False, add_generation_prompt=True)
     if not full_text.startswith(prompt_text):
         raise ValueError("prompt text must be a prefix of the full text")
     return {**example, "prompt": prompt_text, "completion": full_text[len(prompt_text):]}
