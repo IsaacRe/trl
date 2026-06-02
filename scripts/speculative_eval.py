@@ -55,6 +55,10 @@ class SpecDecConfig:
         default=32,
         metadata={"help": "Number of samples whose draft requests are batched together during spec-dec eval."},
     )
+    baseline_eval_on_start: bool = field(
+        default=False,
+        metadata={"help": "Run the full/spec-dec evals once before the first training step (step-0 baseline)."},
+    )
 
 
 @dataclass
@@ -412,11 +416,29 @@ class SpeculativeAcceptanceCallback(TrainerCallback):
             each carrying its own samples and drafting hyperparameters.
     """
 
-    def __init__(self, tokenizer, eval_entries: list[SpecDecEvalEntry], full_eval_entries: list[FullEvalEntry], batch_size: int = 1):
+    def __init__(self, tokenizer, eval_entries: list[SpecDecEvalEntry], full_eval_entries: list[FullEvalEntry], batch_size: int = 1, eval_on_start: bool = False):
         self.tokenizer = tokenizer
         self.eval_entries = eval_entries
         self.full_eval_entries = full_eval_entries
         self.batch_size = batch_size
+        self.eval_on_start = eval_on_start
+
+    def on_train_begin(
+        self,
+        args: TrainingArguments,
+        state: TrainerState,
+        control: TrainerControl,
+        model,
+        **kwargs,
+    ):
+        # Optional step-0 baseline: evaluate once before the first training step.
+        if not self.eval_on_start:
+            return
+        full_eval_entries = [e for e in self.full_eval_entries if e.eval_samples]
+        spec_dec_entries = [e for e in self.eval_entries if e.eval_samples]
+        if full_eval_entries or spec_dec_entries:
+            logger.warning("Running step-0 baseline eval before training…")
+            self._run_evals(args, state, model, full_eval_entries, spec_dec_entries)
 
     def on_step_end(
         self,
@@ -436,6 +458,9 @@ class SpeculativeAcceptanceCallback(TrainerCallback):
             e for e in self.eval_entries
             if e.eval_samples and e.eval_steps and state.global_step % e.eval_steps == 0
         ]
+        self._run_evals(args, state, model, full_eval_entries, spec_dec_entries)
+
+    def _run_evals(self, args, state, model, full_eval_entries, spec_dec_entries):
         if not full_eval_entries and not spec_dec_entries:
             return
 
@@ -463,7 +488,7 @@ class SpeculativeAcceptanceCallback(TrainerCallback):
             torch.cuda.empty_cache()
 
         if all_metrics:
-            logger.warning("Full eval metrics: %s", all_metrics)
+            logger.warning("Eval metrics: %s", all_metrics)
             if "wandb" in (args.report_to or []):
                 if wandb.run is not None:
                     wandb.log({**all_metrics, "train/global_step": state.global_step})

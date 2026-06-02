@@ -412,6 +412,7 @@ def main(script_args, training_args, model_args, dataset_args, spec_dec_args):
         eval_entries=eval_entries,
         full_eval_entries=full_eval_entries,
         batch_size=spec_dec_args.spec_dec_batch_size,
+        eval_on_start=spec_dec_args.baseline_eval_on_start,
     )]
 
     # ------------------------------------------------------------------

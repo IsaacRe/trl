@@ -92,6 +92,7 @@ full_eval:
       max_length: 8_192
 
 spec_dec_batch_size: 1
+baseline_eval_on_start: true
 spec_dec_eval:
   eval_steps: 50
   datasets:
