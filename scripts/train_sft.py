@@ -382,6 +382,11 @@ def main(script_args, training_args, model_args, dataset_args, spec_dec_args):
                             break
         return raw
 
+    # Every rank loads the same (small) eval sample lists. The eval callback then
+    # shards them across ranks (`samples[rank::world_size]`) and gathers results
+    # to the main process, so eval runs ~world_size× faster instead of redundantly.
+    # The explicit eval datasets are loaded identically on every rank (a streamed
+    # islice of a handful of rows), so the per-rank shards partition cleanly.
     eval_entries: list[SpecDecEvalEntry] = []
     for cfg in _load_yaml_eval_section(sys.argv, "spec_dec_eval", SpecDecEvalConfig):
         eval_entries.append(SpecDecEvalEntry(

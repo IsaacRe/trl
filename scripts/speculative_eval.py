@@ -30,6 +30,8 @@ import re
 import wandb
 
 import torch
+from accelerate import PartialState
+from accelerate.utils import gather_object
 from tqdm.auto import tqdm
 from transformers import DynamicCache, TrainerCallback, TrainerControl, TrainerState, TrainingArguments
 
@@ -437,7 +439,8 @@ class SpeculativeAcceptanceCallback(TrainerCallback):
         full_eval_entries = [e for e in self.full_eval_entries if e.eval_samples]
         spec_dec_entries = [e for e in self.eval_entries if e.eval_samples]
         if full_eval_entries or spec_dec_entries:
-            logger.warning("Running step-0 baseline eval before training…")
+            if PartialState().is_main_process:
+                logger.warning("Running step-0 baseline eval before training…")
             self._run_evals(args, state, model, full_eval_entries, spec_dec_entries)
 
     def on_step_end(
@@ -467,17 +470,22 @@ class SpeculativeAcceptanceCallback(TrainerCallback):
         was_training = model.training
         model.eval()
         device = next(model.parameters()).device
+        # Every rank runs the evals (each on its sample shard) and reaches the same
+        # gathers, but only the main process prints the progress/metric lines.
+        is_main = PartialState().is_main_process
 
         all_metrics: dict[str, float] = {}
         try:
             for entry in full_eval_entries:
-                logger.warning("Running full eval on %d samples [%s]…", len(entry.eval_samples), entry.name)
+                if is_main:
+                    logger.warning("Running full eval on %d samples [%s]…", len(entry.eval_samples), entry.name)
                 try:
                     all_metrics.update(self._run_full_eval(model, device, entry))
                 except Exception:
                     logger.exception("Full eval failed for entry %s", entry.name)
             for entry in spec_dec_entries:
-                logger.warning("Running spec dec eval on %d samples [%s]…", len(entry.eval_samples), entry.name)
+                if is_main:
+                    logger.warning("Running spec dec eval on %d samples [%s]…", len(entry.eval_samples), entry.name)
                 try:
                     all_metrics.update(self._run(model, device, entry, batch_size=self.batch_size, seed=args.seed))
                 except Exception:
@@ -487,7 +495,7 @@ class SpeculativeAcceptanceCallback(TrainerCallback):
                 model.train()
             torch.cuda.empty_cache()
 
-        if all_metrics:
+        if all_metrics and is_main:
             logger.warning("Eval metrics: %s", all_metrics)
             if "wandb" in (args.report_to or []):
                 if wandb.run is not None:
@@ -500,13 +508,17 @@ class SpeculativeAcceptanceCallback(TrainerCallback):
         Each turn is evaluated independently: the KV cache is built from scratch
         for that turn's full prefix (all prior turns, with reasoning stripped by
         the chat template) and discarded between turns.
+
+        Under DDP each rank evaluates its shard of the samples; the per-rank token
+        counts are summed across ranks below before the accuracy ratios are formed.
         """
         total_correct = total_tokens = 0
         think_correct = think_tokens = 0
         nothink_correct = nothink_tokens = 0
         chunk_size = 2048
 
-        for sample in entry.eval_samples:
+        state = PartialState()
+        for sample in entry.eval_samples[state.process_index :: state.num_processes]:
             messages = sample.get("messages") or sample.get("conversations") or []
             if not messages:
                 continue
@@ -563,6 +575,15 @@ class SpeculativeAcceptanceCallback(TrainerCallback):
                         nothink_tokens  += (lbl_mask & ~tmask).sum().item()
                     del out
                 del past_key_values
+
+        # Sum the per-rank count accumulators into a global total. Every rank reaches
+        # this gather — even one whose shard was empty — so it cannot deadlock.
+        counts = gather_object(
+            [(total_correct, total_tokens, think_correct, think_tokens, nothink_correct, nothink_tokens)]
+        )
+        total_correct, total_tokens   = sum(c[0] for c in counts), sum(c[1] for c in counts)
+        think_correct, think_tokens   = sum(c[2] for c in counts), sum(c[3] for c in counts)
+        nothink_correct, nothink_tokens = sum(c[4] for c in counts), sum(c[5] for c in counts)
 
         if total_tokens == 0:
             return {}
@@ -713,7 +734,12 @@ class SpeculativeAcceptanceCallback(TrainerCallback):
     def _run(self, model, device, entry: SpecDecEvalEntry, batch_size: int = 1, seed: int = 0) -> dict[str, float]:
         d, n = entry.d_tokens, entry.n_drafts
         tokenizer = self.tokenizer
-        n_samples = len(entry.eval_samples)
+        # Under DDP each rank drafts on its shard of the samples, keeping each sample's
+        # global index so the per-request RNG seed (and thus the sampled drafts) is
+        # independent of how samples are split across ranks. Records are gathered below.
+        state = PartialState()
+        local_samples = list(enumerate(entry.eval_samples))[state.process_index :: state.num_processes]
+        n_local = len(local_samples)
         # Sample drafts the way the model actually generates: temperature comes from
         # the entry, but top-k / top-p are taken from the model's generation config.
         top_k = model.generation_config.top_k
@@ -724,7 +750,8 @@ class SpeculativeAcceptanceCallback(TrainerCallback):
         # depend on the order in which concurrently-batched samples complete.
         records: list[tuple[int, int, int, bool, list[int]]] = []
 
-        pbar = tqdm(total=n_samples, desc=f"[{entry.name}]", unit="sample", leave=False)
+        pbar = tqdm(total=n_local, desc=f"[{entry.name}]", unit="sample", leave=False,
+                    disable=not state.is_main_process)
 
         # --- Async batcher -------------------------------------------------
         # Each sample runs as a coroutine. When it needs drafts it parks on a
@@ -869,11 +896,17 @@ class SpeculativeAcceptanceCallback(TrainerCallback):
                 _maybe_flush()
 
         async def _driver() -> None:
-            active["n"] = n_samples
-            await asyncio.gather(*[_worker(i, s) for i, s in enumerate(entry.eval_samples)])
+            active["n"] = n_local
+            await asyncio.gather(*[_worker(i, s) for i, s in local_samples])
 
         asyncio.run(_driver())
         pbar.close()
+
+        # Gather every rank's per-step records onto all ranks (each rank reaches this
+        # call even with an empty shard, so it cannot deadlock). Metrics below are then
+        # aggregated identically on every rank in a fixed (i, j, step) order, and the
+        # caller logs them on the main process only.
+        records = gather_object(records)
 
         # --- Aggregate metrics in deterministic (i, j, step) order ---------
         pos_avg:          list[list[float]] = [[] for _ in range(d)]
