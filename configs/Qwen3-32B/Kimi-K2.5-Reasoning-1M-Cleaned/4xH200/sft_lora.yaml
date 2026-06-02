@@ -37,15 +37,15 @@ run_name: kimi_reasoning_sft
 
 # Training hyperparameters
 max_steps: 10_000
-per_device_train_batch_size: 2
-gradient_accumulation_steps: 4
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 8
 learning_rate: 2.0e-4
 lr_scheduler_type: cosine
 warmup_ratio: 0.05
 weight_decay: 0.01
 
 # Sequence length
-max_length: 32_000
+max_length: 24_000
 packing: false
 
 # Precision & memory
@@ -85,13 +85,13 @@ full_eval:
       dataset_config: General-Distillation
       name: k2.5-reasoning-heldout
       n_samples: 5
-      max_length: 32_000
+      max_length: 24_000
     - dataset: isaacrehg/Jackrong-Kimi_K2.5_Reasoning_1M_Cleaned-K2.6
       name: k2.6-reasoning-heldout
       n_samples: 5
-      max_length: 32_000
+      max_length: 24_000
 
-spec_dec_batch_size: 16
+spec_dec_batch_size: 1
 baseline_eval_on_start: true
 spec_dec_eval:
   eval_steps: 50
@@ -100,15 +100,15 @@ spec_dec_eval:
     - dataset: Jackrong/Kimi-K2.5-Reasoning-1M-Cleaned
       dataset_config: General-Distillation
       name: k2.5-reasoning-heldout
-      n_samples: 8
+      n_samples: 4
       n_drafts: 1
       d_tokens: 16
       temperature: 0.6
-      max_characters: 16_000
+      max_characters: 8_000
     - dataset: isaacrehg/Jackrong-Kimi_K2.5_Reasoning_1M_Cleaned-K2.6
       name: k2.6-reasoning-heldout
-      n_samples: 8
+      n_samples: 4
       n_drafts: 1
       d_tokens: 16
       temperature: 0.6
-      max_characters: 16_000
+      max_characters: 8_000

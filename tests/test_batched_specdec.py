@@ -101,8 +101,10 @@ def install_mock_drafter(vocab_size: int):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--mode", choices=["mock", "gpu"], required=True)
-    ap.add_argument("--parquet", default="data/kimi-k2.6-claude-code-traces.parquet")
-    ap.add_argument("--dataset-config", default=None)
+    # A HF dataset id (default = the Qwen3-32B run's training set) or a local
+    # .parquet path; load_samples handles both.
+    ap.add_argument("--dataset", default="Jackrong/Kimi-K2.5-Reasoning-1M-Cleaned")
+    ap.add_argument("--dataset-config", default="General-Distillation")
     ap.add_argument("--ckpt", default="outputs/Qwen3_1.7B-kimi_agent_sft-r256-lr2e-4/checkpoint-1")
     ap.add_argument("--base", default="Qwen/Qwen3-1.7B")
     ap.add_argument("--n-samples", type=int, default=3)
@@ -122,7 +124,7 @@ def main():
         from transformers import AutoTokenizer
         tokenizer = AutoTokenizer.from_pretrained(args.base)
         install_mock_drafter(tokenizer.vocab_size)
-        samples = load_samples(args.parquet, args.n_samples, args.dataset_config)
+        samples = load_samples(args.dataset, args.n_samples, args.dataset_config)
         # _run reads model.generation_config for top_k/top_p; the mock drafter never
         # uses the model otherwise, so a tiny stub suffices on CPU.
         model = types.SimpleNamespace(generation_config=types.SimpleNamespace(top_k=20, top_p=0.95))
@@ -137,7 +139,7 @@ def main():
         base = AutoModelForCausalLM.from_pretrained(args.base, dtype=torch.bfloat16, attn_implementation="sdpa")
         model = PeftModel.from_pretrained(base, args.ckpt).to(device)
         model.eval()
-        samples = load_samples(args.parquet, args.n_samples, args.dataset_config)
+        samples = load_samples(args.dataset, args.n_samples, args.dataset_config)
         print(f"[gpu] {len(samples)} samples, model={args.base}+LoRA, dtype=bf16, temp={args.temperature}")
 
     def make_entry():
