@@ -25,20 +25,25 @@ from __future__ import annotations
 
 import argparse
 import itertools
+import os
 import sys
 
-sys.path.insert(0, "scripts")
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "scripts"))
 
 import speculative_eval as se
 from speculative_eval import SpecDecEvalEntry, SpeculativeAcceptanceCallback
 
 
-def load_samples(parquet: str, n: int) -> list[dict]:
+def load_samples(dataset: str, n: int, dataset_config: str | None = None) -> list[dict]:
+    import os
     from datasets import load_dataset
     from train_sft import remap_roles
     from trl.data_utils import maybe_convert_to_chatml
 
-    ds = load_dataset("parquet", data_files=parquet, streaming=True, split="train")
+    if os.path.exists(dataset):
+        ds = load_dataset("parquet", data_files=dataset, streaming=True, split="train")
+    else:
+        ds = load_dataset(dataset, name=dataset_config, streaming=True, split="train")
     return [maybe_convert_to_chatml(remap_roles(dict(s))) for s in itertools.islice(ds, 0, n)]
 
 
@@ -97,6 +102,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--mode", choices=["mock", "gpu"], required=True)
     ap.add_argument("--parquet", default="data/kimi-k2.6-claude-code-traces.parquet")
+    ap.add_argument("--dataset-config", default=None)
     ap.add_argument("--ckpt", default="outputs/Qwen3_1.7B-kimi_agent_sft-r256-lr2e-4/checkpoint-1")
     ap.add_argument("--base", default="Qwen/Qwen3-1.7B")
     ap.add_argument("--n-samples", type=int, default=3)
@@ -112,11 +118,15 @@ def main():
     batch_sizes = [int(x) for x in args.batch_sizes.split(",")]
 
     if args.mode == "mock":
+        import types
         from transformers import AutoTokenizer
         tokenizer = AutoTokenizer.from_pretrained(args.base)
         install_mock_drafter(tokenizer.vocab_size)
-        samples = load_samples(args.parquet, args.n_samples)
-        model, device = None, "cpu"
+        samples = load_samples(args.parquet, args.n_samples, args.dataset_config)
+        # _run reads model.generation_config for top_k/top_p; the mock drafter never
+        # uses the model otherwise, so a tiny stub suffices on CPU.
+        model = types.SimpleNamespace(generation_config=types.SimpleNamespace(top_k=20, top_p=0.95))
+        device = "cpu"
         print(f"[mock] {len(samples)} samples, drafter=pure-python (no GPU)")
     else:
         import torch
@@ -127,7 +137,7 @@ def main():
         base = AutoModelForCausalLM.from_pretrained(args.base, dtype=torch.bfloat16, attn_implementation="sdpa")
         model = PeftModel.from_pretrained(base, args.ckpt).to(device)
         model.eval()
-        samples = load_samples(args.parquet, args.n_samples)
+        samples = load_samples(args.parquet, args.n_samples, args.dataset_config)
         print(f"[gpu] {len(samples)} samples, model={args.base}+LoRA, dtype=bf16, temp={args.temperature}")
 
     def make_entry():

@@ -222,6 +222,25 @@ def _forward_extend(model, kv, token_ids: list[int], start_pos: int, device: tor
     return out.logits[0, -1, :], out.past_key_values
 
 
+def _apply_warpers(logits: torch.Tensor, top_k: int | None, top_p: float | None) -> torch.Tensor:
+    """
+    Apply top-k then top-p filtering (HF's default warper order) to temperature-scaled
+    ``logits`` (shape ``(rows, V)``), masking removed tokens to ``-inf``. Mirrors how
+    the model samples under its ``generation_config`` so drafts match real generation.
+    """
+    if top_k and top_k > 0:
+        k = min(top_k, logits.size(-1))
+        thresh = torch.topk(logits, k, dim=-1).values[..., -1, None]
+        logits = logits.masked_fill(logits < thresh, float("-inf"))
+    if top_p is not None and top_p < 1.0:
+        sorted_logits, sorted_idx = torch.sort(logits, descending=False, dim=-1)
+        cum = sorted_logits.softmax(dim=-1).cumsum(dim=-1)
+        remove = cum <= (1.0 - top_p)  # keeps the smallest set with cumprob >= top_p
+        remove = remove.scatter(-1, sorted_idx, remove)
+        logits = logits.masked_fill(remove, float("-inf"))
+    return logits
+
+
 def _draft_from_caches(model, tokenizer, requests: list[dict], device: torch.device) -> list[list[list[int]]]:
     """
     Sample ``n`` drafts of ``d`` tokens for each request, starting from each request's
@@ -282,8 +301,12 @@ def _draft_from_caches(model, tokenizer, requests: list[dict], device: torch.dev
     # One generator per request, reused across the d steps (RNG depends only on seed).
     gens: list[torch.Generator | None] = []
     temps: list[float] = []
+    top_ks: list[int | None] = []
+    top_ps: list[float | None] = []
     for req in requests:
         temps.append(req["temperature"])
+        top_ks.append(req.get("top_k"))
+        top_ps.append(req.get("top_p"))
         if req["temperature"] > 0.0:
             g = torch.Generator(device=device)
             g.manual_seed(req["seed"])
@@ -301,7 +324,8 @@ def _draft_from_caches(model, tokenizer, requests: list[dict], device: torch.dev
             if gens[r_idx] is None:
                 tok[a:b] = lg.argmax(dim=-1)
             else:
-                probs = torch.softmax(lg / temps[r_idx], dim=-1)
+                lg = _apply_warpers(lg / temps[r_idx], top_ks[r_idx], top_ps[r_idx])
+                probs = torch.softmax(lg, dim=-1)
                 tok[a:b] = torch.multinomial(probs, 1, generator=gens[r_idx]).squeeze(-1)
         return tok
 
@@ -665,6 +689,10 @@ class SpeculativeAcceptanceCallback(TrainerCallback):
         d, n = entry.d_tokens, entry.n_drafts
         tokenizer = self.tokenizer
         n_samples = len(entry.eval_samples)
+        # Sample drafts the way the model actually generates: temperature comes from
+        # the entry, but top-k / top-p are taken from the model's generation config.
+        top_k = model.generation_config.top_k
+        top_p = model.generation_config.top_p
 
         # Per-step records: (i, j, step, in_think, k_values). Metrics are aggregated
         # from these afterwards in a fixed (i, j, step) order, so the result does not
@@ -704,6 +732,8 @@ class SpeculativeAcceptanceCallback(TrainerCallback):
                 "n": n,
                 "d": d,
                 "temperature": entry.temperature,
+                "top_k": top_k,
+                "top_p": top_p,
                 "seed": _request_seed(seed, i, j, step),
             }
             pending.append((req, fut))
