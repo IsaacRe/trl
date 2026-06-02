@@ -31,7 +31,7 @@ import wandb
 
 import torch
 from tqdm.auto import tqdm
-from transformers import TrainerCallback, TrainerControl, TrainerState, TrainingArguments
+from transformers import DynamicCache, TrainerCallback, TrainerControl, TrainerState, TrainingArguments
 
 
 logger = logging.getLogger(__name__)
@@ -194,24 +194,52 @@ def _request_seed(base_seed: int, i: int, j: int, step: int) -> int:
     return h
 
 
-def _draft_batch(model, tokenizer, requests: list[dict], device: torch.device) -> list[list[list[int]]]:
+def _common_prefix_len(a: list[int], b: list[int]) -> int:
+    """Length of the longest common prefix of two token-id lists."""
+    n = 0
+    for x, y in zip(a, b):
+        if x != y:
+            break
+        n += 1
+    return n
+
+
+def _forward_extend(model, kv, token_ids: list[int], start_pos: int, device: torch.device):
     """
-    Decode a batch of draft requests in a single set of forward passes.
+    Forward ``token_ids`` (one row) on top of cache ``kv`` (which already holds
+    ``start_pos`` tokens) and return ``(last_logits, kv)`` — the logits at the final
+    token (the distribution for the next token) and the extended cache.
+
+    No attention mask is passed: a single row with a tight (unpadded) cache attends to
+    everything, so the cache it produces is independent of any batch it later joins.
+    Used both for the one-time prompt prefill and for the incremental extension by
+    newly-accepted tokens between speculative steps.
+    """
+    ids = torch.tensor([token_ids], dtype=torch.long, device=device)
+    pos = torch.arange(start_pos, start_pos + len(token_ids), device=device).unsqueeze(0)
+    with torch.inference_mode():
+        out = model(input_ids=ids, position_ids=pos, past_key_values=kv, use_cache=True, logits_to_keep=1)
+    return out.logits[0, -1, :], out.past_key_values
+
+
+def _draft_from_caches(model, tokenizer, requests: list[dict], device: torch.device) -> list[list[list[int]]]:
+    """
+    Sample ``n`` drafts of ``d`` tokens for each request, starting from each request's
+    persistent committed-context cache — without re-prefilling the context.
 
     Each request is a dict with keys:
-        ``context_ids`` (`list[int]`): tokenized context.
-        ``n`` (`int`): number of drafts to sample.
-        ``d`` (`int`): tokens per draft.
-        ``temperature`` (`float`): sampling temperature (``0`` → greedy).
+        ``kv``: the sample's single-row committed-context [`~transformers.DynamicCache`].
+        ``next_logits`` (`Tensor`, shape `(V,)`): logits at the last committed token,
+            i.e. the distribution for the first draft token.
+        ``committed_len`` (`int`): number of real tokens in ``kv``.
+        ``n``, ``d``, ``temperature`` (`int/float`): drafting hyperparameters.
         ``seed`` (`int`): per-request RNG seed (see [`_request_seed`]).
 
-    All requests in a call share ``n`` and ``d`` (they come from one eval entry). Each
-    context is prefilled once; the KV cache is then expanded to ``n`` drafts before the
-    ``d`` decode steps, so the expensive context prefill runs once per request rather
-    than once per draft. A dedicated RNG generator per request (seeded with ``seed``
-    and reused across the ``d`` steps) makes each request's sampled tokens depend only
-    on its own logits and seed — so batching changes results only through floating-point
-    differences in the batched matmuls, never through RNG ordering.
+    The persistent caches are read-only here: they are stacked (left-padded to a common
+    length) into a throwaway batched cache, expanded to ``n`` drafts per request, and
+    decoded for ``d`` steps. The committed caches are built unbatched (and so are
+    batch-invariant), so only the short ``d``-token draft decode sees batched-matmul
+    float differences.
 
     Returns a list aligned with ``requests``; each element is a list of ``n`` token-id
     lists with everything from the first EOS token onward removed.
@@ -219,23 +247,39 @@ def _draft_batch(model, tokenizer, requests: list[dict], device: torch.device) -
     B = len(requests)
     n = requests[0]["n"]
     d = requests[0]["d"]
+    lengths = [req["committed_len"] for req in requests]
+    Lmax = max(lengths)
 
-    lengths = [len(req["context_ids"]) for req in requests]
-    max_len = max(lengths)
-    pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+    # Stack the per-sample committed caches into one (B, …, Lmax, …) batched cache,
+    # left-padding shorter rows; then expand to n drafts per request.
+    n_layers = len(requests[0]["kv"].layers)
+    ddp_data = []
+    for li in range(n_layers):
+        keys, vals = [], []
+        for req, L in zip(requests, lengths):
+            k = req["kv"].layers[li].keys
+            v = req["kv"].layers[li].values
+            pad = Lmax - L
+            if pad:
+                k = torch.nn.functional.pad(k, (0, 0, pad, 0))
+                v = torch.nn.functional.pad(v, (0, 0, pad, 0))
+            keys.append(k)
+            vals.append(v)
+        ddp_data.append((torch.cat(keys, dim=0), torch.cat(vals, dim=0)))
+    past = DynamicCache(ddp_cache_data=ddp_data)
+    past.batch_repeat_interleave(n)
 
-    # Prefill one row per unique context (left-padded so every row's last column is
-    # its final real context token). The n drafts are produced by expanding the KV
-    # cache afterwards, so the expensive context prefill runs once per request.
-    input_ids = torch.full((B, max_len), pad_id, dtype=torch.long, device=device)
-    attn = torch.zeros((B, max_len), dtype=torch.long, device=device)
-    for r, req in enumerate(requests):
-        L = lengths[r]
-        input_ids[r, max_len - L:] = torch.tensor(req["context_ids"], dtype=torch.long, device=device)
-        attn[r, max_len - L:] = 1
-    position_ids = attn.long().cumsum(-1).sub_(1).clamp_(min=0)
+    # Attention mask over the cached context (0 on the left pad), the position of the
+    # first draft token (= committed length), and the first-token logits — each
+    # expanded to n rows per request.
+    attn = torch.zeros((B, Lmax), dtype=torch.long, device=device)
+    for r, L in enumerate(lengths):
+        attn[r, Lmax - L:] = 1
+    attn = attn.repeat_interleave(n, dim=0)
+    cur_pos = torch.tensor(lengths, dtype=torch.long, device=device).repeat_interleave(n, dim=0)
+    logits = torch.stack([req["next_logits"] for req in requests], dim=0).repeat_interleave(n, dim=0)
 
-    # One generator per request, reused across the d decode steps.
+    # One generator per request, reused across the d steps (RNG depends only on seed).
     gens: list[torch.Generator | None] = []
     temps: list[float] = []
     for req in requests:
@@ -247,13 +291,13 @@ def _draft_batch(model, tokenizer, requests: list[dict], device: torch.device) -
         else:
             gens.append(None)
 
-    rows = B * n  # after expansion; request r owns rows [r*n : (r+1)*n]
+    rows = B * n  # request r owns rows [r*n : (r+1)*n]
 
-    def _sample(logits: torch.Tensor) -> torch.Tensor:  # (rows, V) -> (rows,)
+    def _sample(lg_all: torch.Tensor) -> torch.Tensor:
         tok = torch.empty(rows, dtype=torch.long, device=device)
         for r_idx in range(B):
             a, b = r_idx * n, r_idx * n + n
-            lg = logits[a:b].float()
+            lg = lg_all[a:b].float()
             if gens[r_idx] is None:
                 tok[a:b] = lg.argmax(dim=-1)
             else:
@@ -263,25 +307,11 @@ def _draft_batch(model, tokenizer, requests: list[dict], device: torch.device) -
 
     generated = torch.empty((rows, d), dtype=torch.long, device=device)
     with torch.inference_mode():
-        # logits_to_keep=1: only the final position's logits are computed, so the
-        # full (B, seq_len, vocab) tensor is never materialized during prefill.
-        out = model(
-            input_ids=input_ids, attention_mask=attn, position_ids=position_ids,
-            use_cache=True, logits_to_keep=1,
-        )
-        # Expand the single-context prefill to n drafts per request (contiguously:
-        # [r0,r0,…, r1,r1,…]). batch_repeat_interleave grows the KV cache in place.
-        past = out.past_key_values
-        past.batch_repeat_interleave(n)
-        logits  = out.logits[:, -1, :].repeat_interleave(n, dim=0)
-        attn    = attn.repeat_interleave(n, dim=0)
-        cur_pos = position_ids[:, -1].repeat_interleave(n, dim=0)
         for t in range(d):
             tok = _sample(logits)
             generated[:, t] = tok
             if t == d - 1:
                 break
-            cur_pos = cur_pos + 1
             attn = torch.cat([attn, torch.ones((rows, 1), dtype=torch.long, device=device)], dim=1)
             out = model(
                 input_ids=tok.unsqueeze(1),
@@ -291,8 +321,8 @@ def _draft_batch(model, tokenizer, requests: list[dict], device: torch.device) -
                 use_cache=True,
                 logits_to_keep=1,
             )
-            past = out.past_key_values
             logits = out.logits[:, -1, :]
+            cur_pos = cur_pos + 1
 
     eos_id = tokenizer.eos_token_id
     results: list[list[list[int]]] = []
@@ -653,7 +683,7 @@ class SpeculativeAcceptanceCallback(TrainerCallback):
         def _flush(k: int) -> None:
             batch = pending[:k]
             del pending[:k]
-            outs = _draft_batch(model, tokenizer, [r for r, _ in batch], device)
+            outs = _draft_from_caches(model, tokenizer, [r for r, _ in batch], device)
             for (_, fut), res in zip(batch, outs):
                 fut.set_result(res)
 
@@ -665,10 +695,12 @@ class SpeculativeAcceptanceCallback(TrainerCallback):
             if active["n"] > 0 and pending and len(pending) >= active["n"]:
                 _flush(len(pending))
 
-        async def _draft(context: str, i: int, j: int, step: int) -> list[list[int]]:
+        async def _draft(kv, next_logits, committed_len: int, i: int, j: int, step: int) -> list[list[int]]:
             fut = asyncio.get_running_loop().create_future()
             req = {
-                "context_ids": tokenizer(context).input_ids,
+                "kv": kv,
+                "next_logits": next_logits,
+                "committed_len": committed_len,
                 "n": n,
                 "d": d,
                 "temperature": entry.temperature,
@@ -711,6 +743,14 @@ class SpeculativeAcceptanceCallback(TrainerCallback):
                     if _think_sentinel in target_text else 0
                 )
 
+                # Persistent KV cache for this turn's committed context. The prompt is
+                # prefilled once; each step then forwards only the newly-accepted tokens
+                # (cross-step reuse) instead of re-prefilling the whole context. Draft
+                # tokens are never committed to this cache — only accepted text is.
+                kv = DynamicCache()
+                committed_ids = tokenizer(prompt).input_ids
+                next_logits, kv = _forward_extend(model, kv, committed_ids, 0, device)
+
                 for step in range(128_000):  # hard cap on iterations per turn
                     remaining = target_text[accepted_char_pos:]
                     if not remaining.strip():
@@ -721,8 +761,7 @@ class SpeculativeAcceptanceCallback(TrainerCallback):
 
                     in_think = accepted_char_pos < think_end_idx
 
-                    context = prompt + target_text[:accepted_char_pos]
-                    all_ids = await _draft(context, i, j, step)
+                    all_ids = await _draft(kv, next_logits, len(committed_ids), i, j, step)
 
                     results   = [_accepted_tokens(ids, remaining, tokenizer) for ids in all_ids]
                     k_values  = [r[0] for r in results]
@@ -748,6 +787,18 @@ class SpeculativeAcceptanceCallback(TrainerCallback):
 
                         accepted_char_pos += len(skip_prefix)
                         chars_consumed += len(skip_prefix)
+
+                    # Extend the committed cache to cover the newly-accepted text. The
+                    # accepted prefix is re-tokenized; if a token boundary shifted, the
+                    # cache is cropped back to the divergence point before appending.
+                    if target_text[accepted_char_pos:].strip():
+                        new_committed = tokenizer(prompt + target_text[:accepted_char_pos]).input_ids
+                        P = _common_prefix_len(committed_ids, new_committed)
+                        if P < len(committed_ids):
+                            kv.crop(P)
+                        if len(new_committed) > P:
+                            next_logits, kv = _forward_extend(model, kv, new_committed[P:], P, device)
+                        committed_ids = new_committed
 
         async def _worker(i: int, sample: dict) -> None:
             try:

@@ -60,25 +60,37 @@ def run_entry(tokenizer, model, device, entry, batch_size, seed):
 
 
 # --------------------------------------------------------------------------
-# Mock drafter — pure function of (seed, indices, context tail). No GPU.
+# Mock drafter — pure function of (seed, committed_len). No GPU. Stubs both the
+# per-sample cache extension and the batched draft so the orchestration can be
+# checked for batch-invariance on CPU. Drafts depend only on per-sample state
+# (seed, committed_len), never on batch composition, so any batch size must give
+# bit-identical results.
 # --------------------------------------------------------------------------
+class _FakeKV:
+    def crop(self, n):  # cross-step rollback is a no-op for the stub
+        pass
+
+
 def install_mock_drafter(vocab_size: int):
-    def _mock(model, tokenizer, requests, device):
+    def _mock_extend(model, kv, token_ids, start_pos, device):
+        return None, _FakeKV()
+
+    def _mock_draft(model, tokenizer, requests, device):
         results = []
         for req in requests:
-            seed = req["seed"]
-            tail = req["context_ids"][-1] if req["context_ids"] else 0
+            seed, cl = req["seed"], req["committed_len"]
             drafts = []
             for draft_idx in range(req["n"]):
                 toks = [
-                    (seed * 1009 + draft_idx * 31 + t * 7 + tail) % vocab_size
+                    (seed * 1009 + draft_idx * 31 + t * 7 + cl) % vocab_size
                     for t in range(req["d"])
                 ]
                 drafts.append(toks)
             results.append(drafts)
         return results
 
-    se._draft_batch = _mock
+    se._forward_extend = _mock_extend
+    se._draft_from_caches = _mock_draft
 
 
 def main():
@@ -136,6 +148,8 @@ def main():
     print(f"\nbatch=1 reproducibility: max|Δ|={d0:.3e} ({'OK' if d0 == 0.0 else 'NONDETERMINISTIC @ '+k0})")
     print(f"baseline metrics ({len(base_metrics)} keys), e.g. avg@{args.n_drafts}_pos1 = "
           f"{base_metrics.get(f'spec_acc/test/avg@{args.n_drafts}_pos1')}")
+    import json
+    print("BASELINE_JSON=" + json.dumps(base_metrics))
 
     ok = (d0 == 0.0)
     for bs in batch_sizes:
