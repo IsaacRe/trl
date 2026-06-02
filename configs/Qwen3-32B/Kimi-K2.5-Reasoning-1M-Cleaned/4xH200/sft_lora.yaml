@@ -1,9 +1,11 @@
 # LoRA fine-tuning: Qwen3-32B on Jackrong/Kimi-K2.5-Reasoning-1M-Cleaned (General-Distillation)
 # Rank-256 LoRA on q_proj, k_proj, v_proj, o_proj only (same LoRA config as Qwen3-1.7B).
 #
-# Run with:
-#   CUDA_VISIBLE_DEVICES=0 .venv/bin/python scripts/train_sft.py \
-#     --config configs/Qwen3-32B/Kimi-K2.5-Reasoning-1M-Cleaned/sft_lora.yaml
+# 4×H200 DDP run (replicate the 61 GB model per GPU; effective batch
+# 2 × accum 8 × 4 GPUs = 64). Launch with:
+#   accelerate launch --config_file examples/accelerate_configs/multi_gpu.yaml \
+#     --num_processes 4 scripts/train_sft.py \
+#     --config configs/Qwen3-32B/Kimi-K2.5-Reasoning-1M-Cleaned/4xH200/sft_lora.yaml
 
 # Dataset — single source, wrapped in `interleave_datasets` so `skip_samples`
 # applies: the first 50 rows are held out from training and used for eval below.
@@ -37,7 +39,7 @@ run_name: kimi_reasoning_sft
 
 # Training hyperparameters
 max_steps: 10_000
-per_device_train_batch_size: 1
+per_device_train_batch_size: 2
 gradient_accumulation_steps: 8
 learning_rate: 2.0e-4
 lr_scheduler_type: cosine
@@ -100,14 +102,14 @@ spec_dec_eval:
     - dataset: Jackrong/Kimi-K2.5-Reasoning-1M-Cleaned
       dataset_config: General-Distillation
       name: k2.5-reasoning-heldout
-      n_samples: 4
+      n_samples: 2
       n_drafts: 1
       d_tokens: 16
       temperature: 0.6
       max_characters: 8_000
     - dataset: isaacrehg/Jackrong-Kimi_K2.5_Reasoning_1M_Cleaned-K2.6
       name: k2.6-reasoning-heldout
-      n_samples: 4
+      n_samples: 2
       n_drafts: 1
       d_tokens: 16
       temperature: 0.6
