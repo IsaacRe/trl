@@ -10,6 +10,7 @@ Usage:
 """
 
 import dataclasses
+import glob
 import itertools
 import json
 import logging
@@ -17,7 +18,10 @@ import os
 import random
 import re
 import sys
+import threading
+import time
 
+from tqdm.auto import tqdm
 from transformers import AutoTokenizer
 
 sys.path.insert(0, os.path.dirname(__file__))
@@ -145,6 +149,33 @@ def _to_prompt_completion(example, tokenizer) -> dict:
     return {**example, "prompt": prompt_text, "completion": full_text[len(prompt_text):]}
 
 
+def _proc_rss_gb() -> float:
+    """Resident set size of this process in GiB, read from /proc."""
+    with open(f"/proc/{os.getpid()}/status") as f:
+        for line in f:
+            if line.startswith("VmRSS:"):
+                return int(line.split()[1]) / (1024 * 1024)
+    return 0.0
+
+
+def _weight_bytes(model_name_or_path: str) -> float | None:
+    """Total size (GiB) of the model's local *.safetensors shards, or None.
+
+    Used as the target for a materialization progress bar: the "Loading weights"
+    bar only mmaps the shards (instant); the real cost is faulting that many bytes
+    into RAM afterwards, which has no HF progress bar of its own.
+    """
+    if os.path.isdir(model_name_or_path):
+        shards = glob.glob(os.path.join(model_name_or_path, "*.safetensors"))
+    else:
+        from huggingface_hub import try_to_load_from_cache
+        idx = try_to_load_from_cache(model_name_or_path, "model.safetensors.index.json")
+        snap = os.path.dirname(idx) if isinstance(idx, str) else ""
+        shards = glob.glob(os.path.join(snap, "*.safetensors")) if snap else []
+    total = sum(os.path.getsize(f) for f in shards)
+    return total / (1024 ** 3) if total else None
+
+
 def _compose_run_name(training_args, model_args) -> str:
     model_short = model_args.model_name_or_path.split("/")[-1].replace("-", "_")
     rank_str = f"r{model_args.lora_r}" if getattr(model_args, "use_peft", False) else "full"
@@ -187,18 +218,47 @@ def main(script_args, training_args, model_args, dataset_args, spec_dec_args):
     config = AutoConfig.from_pretrained(model_args.model_name_or_path)
     valid_image_text_architectures = MODEL_FOR_IMAGE_TEXT_TO_TEXT_MAPPING_NAMES.values()
 
-    if config.architectures and any(arch in valid_image_text_architectures for arch in config.architectures):
-        from transformers import AutoModelForImageTextToText
+    # The "Loading weights" bar only mmaps the shards (instant). The real cost is
+    # materializing those bytes into RAM, which has no HF bar — so poll RSS in a
+    # background thread and show it against the on-disk shard size.
+    weight_gb = _weight_bytes(model_args.model_name_or_path)
+    logger.warning("Loading model (mmap is instant; materializing %s into RAM)…",
+                   f"~{weight_gb:.0f} GB" if weight_gb else "weights")
+    t_model = time.time()
+    load_done = threading.Event()
 
-        model = AutoModelForImageTextToText.from_pretrained(model_args.model_name_or_path, **model_kwargs)
-    else:
-        model = AutoModelForCausalLM.from_pretrained(model_args.model_name_or_path, **model_kwargs)
+    def _watch_rss():
+        base = _proc_rss_gb()
+        # Count bytes and let tqdm's unit_scale render GB (e.g. "42.0GB/61.0GB,
+        # 0.6GB/s") — avoids a custom bar_format.
+        bar = tqdm(total=int(weight_gb * 1024 ** 3) if weight_gb else None,
+                   desc="Materializing weights", unit="B", unit_scale=True, unit_divisor=1024, leave=False)
+        while not load_done.wait(1.0):
+            bar.n = int(max(_proc_rss_gb() - base, 0.0) * 1024 ** 3)
+            bar.refresh()
+        bar.close()
+
+    rss_thread = threading.Thread(target=_watch_rss, daemon=True)
+    rss_thread.start()
+    try:
+        if config.architectures and any(arch in valid_image_text_architectures for arch in config.architectures):
+            from transformers import AutoModelForImageTextToText
+
+            model = AutoModelForImageTextToText.from_pretrained(model_args.model_name_or_path, **model_kwargs)
+        else:
+            model = AutoModelForCausalLM.from_pretrained(model_args.model_name_or_path, **model_kwargs)
+    finally:
+        load_done.set()
+        rss_thread.join(timeout=3)
+    logger.warning("Model materialized in %.1fs (RSS now %.1f GB)", time.time() - t_model, _proc_rss_gb())
 
     tokenizer = AutoTokenizer.from_pretrained(model_args.model_name_or_path)
 
     # ------------------------------------------------------------------
     # Dataset
     # ------------------------------------------------------------------
+    logger.info("Model + tokenizer ready. Loading training dataset…")
+    _t_data = time.time()
     interleave_specs = _read_yaml_scalar(sys.argv, "interleave_datasets", []) or []
     if interleave_specs:
         from datasets import IterableDataset, IterableDatasetDict, interleave_datasets
@@ -254,7 +314,7 @@ def main(script_args, training_args, model_args, dataset_args, spec_dec_args):
         )
         dataset = IterableDatasetDict({script_args.dataset_train_split: interleaved})
     elif dataset_args.datasets and script_args.dataset_name:
-        logger.warning(
+        logger.info(
             "Both `datasets` and `dataset_name` are provided. The `datasets` argument will be used to load the "
             "dataset and `dataset_name` will be ignored."
         )
@@ -270,6 +330,7 @@ def main(script_args, training_args, model_args, dataset_args, spec_dec_args):
 
     # Remap ShareGPT role names and convert to ChatML format before TRL processes them
     dataset = dataset.map(lambda ex: maybe_convert_to_chatml(remap_roles(ex)))
+    logger.info("Training dataset ready in %.1fs. Building eval sets…", time.time() - _t_data)
 
     # ------------------------------------------------------------------
     # Eval datasets — built from the spec_dec_eval list in the YAML.
@@ -280,19 +341,35 @@ def main(script_args, training_args, model_args, dataset_args, spec_dec_args):
         # Skip the first `skip_samples`, then take the next `n_samples`. When
         # `shuffle` is set the dataset is loaded non-streaming and shuffled
         # before slicing — streaming and shuffling are mutually exclusive.
+        t0 = time.time()
+        streaming = not cfg.shuffle
+        logger.info(
+            "Loading %d eval sample(s) from %s [%s] (shuffle=%s, streaming=%s)…",
+            cfg.n_samples, cfg.dataset, cfg.name, cfg.shuffle, streaming,
+        )
         start, stop = cfg.skip_samples, cfg.skip_samples + cfg.n_samples
         if cfg.dataset == script_args.dataset_name:
             src = dataset[script_args.dataset_train_split]
         elif os.path.exists(cfg.dataset):
-            src = load_dataset("parquet", data_files=cfg.dataset, streaming=not cfg.shuffle, split="train")
+            src = load_dataset("parquet", data_files=cfg.dataset, streaming=streaming, split="train")
         else:
-            src = load_dataset(cfg.dataset, name=cfg.dataset_config, streaming=not cfg.shuffle, split="train")
+            src = load_dataset(cfg.dataset, name=cfg.dataset_config, streaming=streaming, split="train")
         if cfg.shuffle:
+            # Non-streaming: the whole dataset is downloaded/generated above, then
+            # shuffled in memory — this is the slow part for `shuffle: true` entries.
+            logger.info("  [%s] materializing full dataset to shuffle (non-streaming)…", cfg.name)
             src = src.shuffle(seed=training_args.seed)
         raw = [
             maybe_convert_to_chatml(remap_roles(dict(s)))
-            for s in itertools.islice(src, start, stop)
+            for s in tqdm(
+                itertools.islice(src, start, stop),
+                total=cfg.n_samples,
+                desc=f"  [{cfg.name}] loading samples",
+                unit="sample",
+                leave=False,
+            )
         ]
+        logger.info("  [%s] loaded %d sample(s) in %.1fs", cfg.name, len(raw), time.time() - t0)
         if cfg.max_turns is not None:
             for s in raw:
                 msgs = s.get("messages") or s.get("conversations") or []
@@ -325,6 +402,10 @@ def main(script_args, training_args, model_args, dataset_args, spec_dec_args):
             eval_samples=_load_samples(cfg),
             max_length=cfg.max_length,
         ))
+    logger.info(
+        "Eval sets ready: %d spec-dec + %d full-eval. Starting trainer…",
+        len(eval_entries), len(full_eval_entries),
+    )
 
     callbacks = [SpeculativeAcceptanceCallback(
         tokenizer=tokenizer,

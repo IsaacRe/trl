@@ -52,7 +52,7 @@ class SpecDecConfig:
         metadata={"help": "Skip training and run evaluation only."},
     )
     spec_dec_batch_size: int = field(
-        default=1,
+        default=32,
         metadata={"help": "Number of samples whose draft requests are batched together during spec-dec eval."},
     )
 
@@ -707,6 +707,7 @@ class SpeculativeAcceptanceCallback(TrainerCallback):
         # sample is parked) the queued requests are decoded together in one call.
         pending: list[tuple[dict, asyncio.Future]] = []
         active = {"n": 0}
+        total_chars = {"n": 0}  # characters processed across all samples, shown live in the pbar
 
         def _flush(k: int) -> None:
             batch = pending[:k]
@@ -805,6 +806,7 @@ class SpeculativeAcceptanceCallback(TrainerCallback):
                     if best_lcp > 0:
                         accepted_char_pos += best_lcp
                         chars_consumed += best_lcp
+                        total_chars["n"] += best_lcp
                     else:
                         # Nothing matched — advance by minimum number of draft tokens that will
                         # get us to next clean utf-8 boundary in decoded text
@@ -817,6 +819,9 @@ class SpeculativeAcceptanceCallback(TrainerCallback):
 
                         accepted_char_pos += len(skip_prefix)
                         chars_consumed += len(skip_prefix)
+                        total_chars["n"] += len(skip_prefix)
+
+                    pbar.set_postfix(chars=total_chars["n"])
 
                     # Extend the committed cache to cover the newly-accepted text. The
                     # accepted prefix is re-tokenized; if a token boundary shifted, the
