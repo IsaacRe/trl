@@ -39,8 +39,8 @@ run_name: glm_reasoning_sft
 
 # Training hyperparameters
 max_steps: 10_000
-per_device_train_batch_size: 4
-gradient_accumulation_steps: 4
+per_device_train_batch_size: 2
+gradient_accumulation_steps: 8
 learning_rate: 2.0e-4
 lr_scheduler_type: cosine
 warmup_ratio: 0.05
@@ -77,6 +77,7 @@ save_steps: 500
 
 # Misc
 dataloader_num_workers: 1
+ddp_timeout: 900
 
 # Full forward-pass eval (loss, token accuracy, entropy)
 full_eval:
@@ -101,5 +102,5 @@ spec_dec_eval:
       n_samples: 4
       n_drafts: 1
       d_tokens: 16
-      temperature: 0.6
+      temperature: 0.0
       max_characters: 3_500

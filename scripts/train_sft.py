@@ -21,6 +21,15 @@ import sys
 import threading
 import time
 
+# wandb wraps stdout/stderr to stream console logs to its backend. On the main DDP
+# rank a backed-up wandb pipe makes a training-loop print/tqdm write block, so that
+# rank never reaches the next gradient all-reduce and the other ranks spin in it
+# forever (silent hang). Disable console capture — metrics still flow via wandb.log.
+# Also make a stalled NCCL collective abort with a traceback instead of hanging
+# indefinitely. Both are setdefault so an explicit env override still wins.
+os.environ.setdefault("WANDB_CONSOLE", "off")
+os.environ.setdefault("TORCH_NCCL_ASYNC_ERROR_HANDLING", "1")
+
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer
 
