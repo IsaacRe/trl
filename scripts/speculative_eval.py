@@ -377,6 +377,18 @@ def _lcp_len(a: str, b: str) -> int:
     return n
 
 
+def _first_token_chars(text: str, tokenizer) -> int:
+    """Char length of the smallest leading token-run of ``text`` that ends on a clean
+    (round-trippable) character boundary — normally a single token. Used to force-commit
+    the speculative-decoding correction token at the mismatch position."""
+    ids = tokenizer.encode(text[:50])
+    cnt, prefix = 0, ""
+    while (cnt == 0 or text[: len(prefix)] != prefix) and cnt < len(ids):
+        cnt += 1
+        prefix = tokenizer.decode(ids[:cnt])
+    return len(prefix)
+
+
 def _accepted_tokens(draft_ids: list[int], target_remaining: str, tokenizer) -> tuple[int, int]:
     """
     Returns ``(n_accepted, lcp_chars)``.
@@ -877,25 +889,19 @@ class SpeculativeAcceptanceCallback(TrainerCallback):
                     best_k   = max(k_values)
                     best_idx = k_values.index(best_k)
 
-                    # advance to next fully accepted token boundary of best draft proposal
+                    # Accept the matching draft prefix, then force-commit one correction
+                    # token: the ground-truth token at the mismatch position — the bonus/
+                    # correction token a real spec-dec engine gets free from the target. So
+                    # each step advances accepted+1, which guarantees ≥1 token of progress
+                    # and stops a hard (run-breaking) token from reappearing as the next
+                    # step's position-1. Without it, greedy re-drafts and misses that token
+                    # every step, pinning pos-1 acceptance near zero and crawling ~1 tok/step.
                     best_lcp = len(tokenizer.decode(all_ids[best_idx][:best_k]))
-                    if best_lcp > 0:
-                        accepted_char_pos += best_lcp
-                        chars_consumed += best_lcp
-                        total_chars["n"] += best_lcp
-                    else:
-                        # Nothing matched — advance by minimum number of draft tokens that will
-                        # get us to next clean utf-8 boundary in decoded text
-                        skip_token_cnt = 0
-                        skip_prefix = ""
-                        remaining_ids = tokenizer.encode(remaining[:50])
-                        while skip_token_cnt == 0 or remaining[:len(skip_prefix)] != skip_prefix:
-                            skip_token_cnt += 1
-                            skip_prefix = tokenizer.decode(remaining_ids[:skip_token_cnt])
-
-                        accepted_char_pos += len(skip_prefix)
-                        chars_consumed += len(skip_prefix)
-                        total_chars["n"] += len(skip_prefix)
+                    rest = target_text[accepted_char_pos + best_lcp:]
+                    advanced = best_lcp + (_first_token_chars(rest, tokenizer) if rest.strip() else 0)
+                    accepted_char_pos += advanced
+                    chars_consumed += advanced
+                    total_chars["n"] += advanced
 
                     pbar.set_postfix(chars=total_chars["n"])
 
@@ -936,6 +942,15 @@ class SpeculativeAcceptanceCallback(TrainerCallback):
             by_name.setdefault(rec[0], []).append(rec)
 
         out: dict[str, float] = {}
+
+        # Acceptance length: mean tokens committed per speculative step. That's the mean
+        # accepted draft tokens — k = #{pos : k > pos}, so E[k] = Σ_pos P(k > pos), the
+        # sum of the per-position rates over all d positions — plus 1 for the correction/
+        # bonus token force-committed each step. So it's the throughput multiplier vs
+        # one-token-per-step decoding.
+        def _accept_len(rows: list[list[float]]) -> float:
+            return sum(sum(p) / len(p) for p in rows) + 1
+
         for entry in entries:
             d, n = entry.d_tokens, entry.n_drafts
             pos_avg:          list[list[float]] = [[] for _ in range(d)]
@@ -969,4 +984,18 @@ class SpeculativeAcceptanceCallback(TrainerCallback):
                 if nothink_pos_avg[pos]:
                     out[f"spec_acc/{entry.name}/avg@{n}_pos{pos + 1}_nothink"]  = sum(nothink_pos_avg[pos])  / len(nothink_pos_avg[pos])
                     out[f"spec_acc/{entry.name}/best@{n}_pos{pos + 1}_nothink"] = sum(nothink_pos_best[pos]) / len(nothink_pos_best[pos])
+
+            # Headline efficiency: mean tokens committed per step (acceptance length),
+            # aggregated over all steps — accepted draft tokens + the correction/bonus
+            # token. `best` is the best-of-n draft, `avg` is averaged over the n drafts
+            # (identical when n_drafts == 1).
+            if pos_best[0]:
+                out[f"spec_acc/{entry.name}/mean_accepted_best@{n}"] = _accept_len(pos_best)
+                out[f"spec_acc/{entry.name}/mean_accepted_avg@{n}"]  = _accept_len(pos_avg)
+            if think_pos_best[0]:
+                out[f"spec_acc/{entry.name}/mean_accepted_best@{n}_think"] = _accept_len(think_pos_best)
+                out[f"spec_acc/{entry.name}/mean_accepted_avg@{n}_think"]  = _accept_len(think_pos_avg)
+            if nothink_pos_best[0]:
+                out[f"spec_acc/{entry.name}/mean_accepted_best@{n}_nothink"] = _accept_len(nothink_pos_best)
+                out[f"spec_acc/{entry.name}/mean_accepted_avg@{n}_nothink"]  = _accept_len(nothink_pos_avg)
         return out
