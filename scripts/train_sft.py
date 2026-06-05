@@ -111,7 +111,6 @@ def _infinite_reshuffled(ds, base_seed: int):
         epoch += 1
 
 
-
 def _make_turn_sampler(seed: int):
     """Return a dataset map function that randomly selects one assistant turn as the
     final turn and drops all subsequent messages.
@@ -438,15 +437,15 @@ def main(script_args, training_args, model_args, dataset_args, spec_dec_args):
     #                                   stripped by the chat template; final turn
     #                                   retains its <think> block)
     #   completion_only_loss: true   → prompt-completion format, loss ONLY on the
-    #                                   selected final assistant turn (with reasoning)
+    #                                   final assistant turn (with reasoning)
     #
-    # In both modes the turn sampler randomly selects which assistant turn is
-    # treated as the final one, dropping all subsequent messages.
+    # Each sample keeps its full trajectory (all turns); no turn sampling.
     # ------------------------------------------------------------------
     train_dataset = dataset[script_args.dataset_train_split]
-    train_dataset = train_dataset.map(_make_turn_sampler(training_args.seed))
 
     if training_args.completion_only_loss is True:
+        # sample a single assistant turn to truncate to and train on
+        train_dataset = train_dataset.map(_make_turn_sampler(training_args.seed))
         train_dataset = train_dataset.map(lambda ex: _to_prompt_completion(ex, tokenizer))
 
     # ------------------------------------------------------------------
