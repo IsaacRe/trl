@@ -35,6 +35,8 @@ from accelerate.utils import gather_object
 from tqdm.auto import tqdm
 from transformers import DynamicCache, TrainerCallback, TrainerControl, TrainerState, TrainingArguments
 
+from trl.chat_template_utils import get_training_chat_template
+
 
 logger = logging.getLogger(__name__)
 
@@ -116,7 +118,7 @@ def _tools_from_sample(sample: dict):
 
 
 def _build_sequence_with_labels(
-    messages: list[dict], tokenizer, tools=None
+    messages: list[dict], tokenizer, tools=None, chat_template=None
 ) -> tuple[list[int], list[int], list[bool]]:
     """
     Tokenize the full conversation and return ``(input_ids, labels, think_mask)``.
@@ -132,13 +134,15 @@ def _build_sequence_with_labels(
     if not messages or messages[-1]["role"] != "assistant":
         raise ValueError("last message must be an assistant message")
 
-    full_text = tokenizer.apply_chat_template(messages, tools=tools, tokenize=False, add_generation_prompt=False)
+    full_text = tokenizer.apply_chat_template(
+        messages, tools=tools, tokenize=False, add_generation_prompt=False, chat_template=chat_template
+    )
     full_ids = tokenizer.encode(full_text)
     labels = [-100] * len(full_ids)
     think_mask = [False] * len(full_ids)
 
     context_text = tokenizer.apply_chat_template(
-        messages[:-1], tools=tools, tokenize=False, add_generation_prompt=True
+        messages[:-1], tools=tools, tokenize=False, add_generation_prompt=True, chat_template=chat_template
     )
     n_context = len(tokenizer.encode(context_text))
 
@@ -160,7 +164,7 @@ def _build_sequence_with_labels(
     return full_ids, labels, think_mask
 
 
-def _assistant_turns(messages: list[dict], tokenizer, tools=None) -> list[tuple[str, str, list[dict]]]:
+def _assistant_turns(messages: list[dict], tokenizer, tools=None, chat_template=None) -> list[tuple[str, str, list[dict]]]:
     """
     Return ``(context, target, turn_messages)`` for every assistant turn.
 
@@ -180,7 +184,8 @@ def _assistant_turns(messages: list[dict], tokenizer, tools=None) -> list[tuple[
         if not target.strip():
             continue
         context = tokenizer.apply_chat_template(
-            messages[:i], tools=tools, tokenize=False, add_generation_prompt=True, enable_thinking=True
+            messages[:i], tools=tools, tokenize=False, add_generation_prompt=True, enable_thinking=True,
+            chat_template=chat_template,
         )
         context = _qwen3_open_think_block(context)
         turns.append((context, target, messages[:i + 1]))
@@ -436,6 +441,13 @@ class SpeculativeAcceptanceCallback(TrainerCallback):
         self.full_eval_entries = full_eval_entries
         self.batch_size = batch_size
         self.eval_on_start = eval_on_start
+        # Render with the same chat template SFTTrainer tokenizes with: when the
+        # tokenizer's own template lacks {% generation %} markers, the trainer swaps
+        # in TRL's prefix-preserving training template (which keeps empty <think>
+        # blocks on intermediate turns instead of stripping them). Using it here too
+        # keeps eval contexts byte-identical to the training format. ``None`` falls
+        # back to the tokenizer's own template, mirroring the trainer.
+        self.chat_template = get_training_chat_template(tokenizer)
 
     def on_train_begin(
         self,
@@ -554,7 +566,7 @@ class SpeculativeAcceptanceCallback(TrainerCallback):
                 turn_messages = messages[:asst_idx + 1]
                 try:
                     input_ids, label_ids, think_mask = _build_sequence_with_labels(
-                        turn_messages, self.tokenizer, tools=tools
+                        turn_messages, self.tokenizer, tools=tools, chat_template=self.chat_template
                     )
                 except ValueError:
                     continue
@@ -649,7 +661,7 @@ class SpeculativeAcceptanceCallback(TrainerCallback):
                 turn_messages = messages[:asst_idx + 1]
                 try:
                     input_ids, label_ids, think_mask = _build_sequence_with_labels(
-                        turn_messages, self.tokenizer, tools=tools
+                        turn_messages, self.tokenizer, tools=tools, chat_template=self.chat_template
                     )
                 except ValueError:
                     prefix_kv  = None
@@ -715,14 +727,16 @@ class SpeculativeAcceptanceCallback(TrainerCallback):
 
                 # Step 3 — build the prefix cache for the next turn.
                 # The next turn's context = apply_chat_template(messages[:next_asst_idx],
-                # add_generation_prompt=True). This strips reasoning from the current
-                # turn (now intermediate) and appends the next user message + prompt.
+                # add_generation_prompt=True). The training chat template is
+                # prefix-preserving (the current turn keeps its <think> block when it
+                # becomes intermediate), so this render extends the current one.
                 # We only need to forward the new suffix tokens (from prefix_len on).
                 next_turn = turn_num + 1
                 if next_turn < len(asst_indices):
                     next_asst_idx  = asst_indices[next_turn]
                     next_ctx_text  = self.tokenizer.apply_chat_template(
-                        messages[:next_asst_idx], tools=tools, tokenize=False, add_generation_prompt=True
+                        messages[:next_asst_idx], tools=tools, tokenize=False, add_generation_prompt=True,
+                        chat_template=self.chat_template,
                     )
                     next_ctx_ids = self.tokenizer.encode(next_ctx_text)
                     if len(next_ctx_ids) > prefix_len:
@@ -839,7 +853,7 @@ class SpeculativeAcceptanceCallback(TrainerCallback):
                 if m["role"] == "assistant":
                     m["content"] = _qwen3_convert_glm_think_blocks(m["content"])
 
-            turns = _assistant_turns(messages, tokenizer, tools=tools)
+            turns = _assistant_turns(messages, tokenizer, tools=tools, chat_template=self.chat_template)
             chars_consumed = 0
             budget_exhausted = False
 
@@ -848,7 +862,9 @@ class SpeculativeAcceptanceCallback(TrainerCallback):
                     break
 
                 # Parity check: prompt + target_text must be a prefix of the fully-templated turn.
-                full = tokenizer.apply_chat_template(turn_messages, tools=tools, tokenize=False)
+                full = tokenizer.apply_chat_template(
+                    turn_messages, tools=tools, tokenize=False, chat_template=self.chat_template
+                )
                 if not full.startswith(prompt + target_text):
                     logger.error("prompt+target is not a prefix of full template")
                     raise ValueError("Prompt/target reconstruction failed parity check")
