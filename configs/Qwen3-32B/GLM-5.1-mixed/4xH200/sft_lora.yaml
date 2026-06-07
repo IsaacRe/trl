@@ -87,7 +87,7 @@ ddp_timeout: 900
 
 # Full forward-pass eval (loss, token accuracy, entropy)
 full_eval:
-  eval_steps: 10
+  eval_steps: 50
   datasets:
     # First 50 rows of Jackrong — the samples skipped during training.
     - dataset: Jackrong/GLM-5.1-Reasoning-1M-Cleaned
@@ -100,11 +100,31 @@ full_eval:
       name: hermes-heldout
       n_samples: 10
       max_length: 24_000
+    - dataset: isaacrehg/Nemotron_Terminal_Synthetic_Tasks-GLM5.1-multiharness
+      dataset_config: no_hermes
+      name: nemotron-mixed
+      n_samples: 10
+      max_length: 24_000
+    - dataset: isaacrehg/Nemotron_Terminal_Synthetic_Tasks-GLM5.1-multiharness
+      dataset_config: hermes
+      name: nemotron-hermes
+      n_samples: 10
+      max_length: 24_000
+    # - dataset: isaacrehg/SWE_rebench_v2-GLM5.1-multiharness
+    #   dataset_config: no_hermes
+    #   name: swe-rebench-mixed
+    #   n_samples: 10
+    #   max_length: 24_000
+    # - dataset: isaacrehg/SWE_rebench_v2-GLM5.1-multiharness
+    #   dataset_config: hermes
+    #   name: swe-rebench-hermes
+    #   n_samples: 10
+    #   max_length: 24_000
 
 spec_dec_batch_size: 1
 baseline_eval_on_start: true
 spec_dec_eval:
-  eval_steps: 50
+  eval_steps: 100
   datasets:
     # First 50 rows of Jackrong — the samples skipped during training.
     - dataset: Jackrong/GLM-5.1-Reasoning-1M-Cleaned
@@ -123,3 +143,40 @@ spec_dec_eval:
       d_tokens: 16
       temperature: 0.0
       max_characters: 3_500
+      max_length: 24_000
+    - dataset: isaacrehg/Nemotron_Terminal_Synthetic_Tasks-GLM5.1-multiharness
+      dataset_config: no_hermes
+      name: nemotron-mixed
+      n_samples: 4
+      n_drafts: 1
+      d_tokens: 16
+      temperature: 0.0
+      max_characters: 3_500
+      max_length: 24_000
+    - dataset: isaacrehg/Nemotron_Terminal_Synthetic_Tasks-GLM5.1-multiharness
+      dataset_config: hermes
+      name: nemotron-hermes
+      n_samples: 4
+      n_drafts: 1
+      d_tokens: 16
+      temperature: 0.0
+      max_characters: 3_500
+      max_length: 24_000
+    # - dataset: isaacrehg/SWE_rebench_v2-GLM5.1-multiharness
+    #   dataset_config: no_hermes
+    #   name: swe-rebench-mixed
+    #   n_samples: 4
+    #   n_drafts: 1
+    #   d_tokens: 16
+    #   temperature: 0.0
+    #   max_characters: 3_500
+    #   max_length: 24_000
+    # - dataset: isaacrehg/SWE_rebench_v2-GLM5.1-multiharness
+    #   dataset_config: hermes
+    #   name: swe-rebench-hermes
+    #   n_samples: 4
+    #   n_drafts: 1
+    #   d_tokens: 16
+    #   temperature: 0.0
+    #   max_characters: 3_500
+    #   max_length: 24_000

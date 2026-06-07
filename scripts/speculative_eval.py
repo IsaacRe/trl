@@ -59,6 +59,13 @@ class SpecDecConfig:
         default=32,
         metadata={"help": "Number of samples whose draft requests are batched together during spec-dec eval."},
     )
+    spec_dec_concurrency: int = field(
+        default=4,
+        metadata={
+            "help": "Number of samples processed concurrently during spec-dec eval. Each in-flight sample "
+            "holds its own per-turn KV cache, so long-context samples need a lower value to fit in memory."
+        },
+    )
     baseline_eval_on_start: bool = field(
         default=False,
         metadata={"help": "Run the full/spec-dec evals once before the first training step (step-0 baseline)."},
@@ -76,6 +83,7 @@ class SpecDecEvalEntry:
     d_tokens: int = 8
     temperature: float = 0.8
     max_characters: int | None = None
+    max_length: int | None = None
 
 
 @dataclass
@@ -435,12 +443,13 @@ class SpeculativeAcceptanceCallback(TrainerCallback):
             each carrying its own samples and drafting hyperparameters.
     """
 
-    def __init__(self, tokenizer, eval_entries: list[SpecDecEvalEntry], full_eval_entries: list[FullEvalEntry], batch_size: int = 1, eval_on_start: bool = False):
+    def __init__(self, tokenizer, eval_entries: list[SpecDecEvalEntry], full_eval_entries: list[FullEvalEntry], batch_size: int = 1, eval_on_start: bool = False, concurrency: int = 4):
         self.tokenizer = tokenizer
         self.eval_entries = eval_entries
         self.full_eval_entries = full_eval_entries
         self.batch_size = batch_size
         self.eval_on_start = eval_on_start
+        self.concurrency = concurrency
         # Render with the same chat template SFTTrainer tokenizes with: when the
         # tokenizer's own template lacks {% generation %} markers, the trainer swaps
         # in TRL's prefix-preserving training template (which keeps empty <think>
@@ -881,8 +890,14 @@ class SpeculativeAcceptanceCallback(TrainerCallback):
                 # prefilled once; each step then forwards only the newly-accepted tokens
                 # (cross-step reuse) instead of re-prefilling the whole context. Draft
                 # tokens are never committed to this cache — only accepted text is.
-                kv = DynamicCache()
                 committed_ids = tokenizer(prompt).input_ids
+                # Stop the sample once a turn's context exceeds max_length tokens — the
+                # KV cache (and its padded copy in the draft batch) scales with context
+                # length and can exhaust GPU memory on long agent traces. Later turns
+                # only grow the context, so stop rather than skip.
+                if entry.max_length is not None and len(committed_ids) > entry.max_length:
+                    break
+                kv = DynamicCache()
                 next_logits, kv = _forward_extend(model, kv, committed_ids, 0, device)
 
                 for step in range(128_000):  # hard cap on iterations per turn
@@ -942,8 +957,13 @@ class SpeculativeAcceptanceCallback(TrainerCallback):
                 _maybe_flush()
 
         async def _driver() -> None:
-            active["n"] = len(local_work)
-            await asyncio.gather(*[_worker(entry, i, s) for entry, i, s in local_work])
+            # Process samples in waves of `concurrency` to bound peak memory: every
+            # in-flight sample holds its own per-turn KV cache, and long-context
+            # samples (e.g. agent traces) can each occupy several GB.
+            for start in range(0, len(local_work), self.concurrency):
+                wave = local_work[start:start + self.concurrency]
+                active["n"] = len(wave)
+                await asyncio.gather(*[_worker(entry, i, s) for entry, i, s in wave])
 
         asyncio.run(_driver())
         pbar.close()

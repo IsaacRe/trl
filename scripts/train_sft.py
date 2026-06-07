@@ -64,6 +64,7 @@ class SpecDecEvalConfig(BaseEvalConfig):
     d_tokens: int = 8
     temperature: float = 0.8
     max_characters: int | None = None
+    max_length: int | None = None
 
 
 @dataclasses.dataclass
@@ -405,6 +406,7 @@ def main(script_args, training_args, model_args, dataset_args, spec_dec_args):
             d_tokens=cfg.d_tokens,
             temperature=cfg.temperature,
             max_characters=cfg.max_characters,
+            max_length=cfg.max_length,
         ))
 
     full_eval_entries: list[FullEvalEntry] = []
@@ -426,6 +428,7 @@ def main(script_args, training_args, model_args, dataset_args, spec_dec_args):
         full_eval_entries=full_eval_entries,
         batch_size=spec_dec_args.spec_dec_batch_size,
         eval_on_start=spec_dec_args.baseline_eval_on_start,
+        concurrency=spec_dec_args.spec_dec_concurrency,
     )]
 
     # ------------------------------------------------------------------
@@ -465,7 +468,7 @@ def main(script_args, training_args, model_args, dataset_args, spec_dec_args):
         trainer.save_metrics("eval", metrics)
         return
 
-    trainer.train()
+    trainer.train(resume_from_checkpoint=training_args.resume_from_checkpoint)
     trainer.accelerator.print("✅ Training completed.")
 
     trainer.save_model(training_args.output_dir)
