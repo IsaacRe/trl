@@ -110,16 +110,16 @@ full_eval:
       name: nemotron-hermes
       n_samples: 10
       max_length: 24_000
-    # - dataset: isaacrehg/SWE_rebench_v2-GLM5.1-multiharness
-    #   dataset_config: no_hermes
-    #   name: swe-rebench-mixed
-    #   n_samples: 10
-    #   max_length: 24_000
-    # - dataset: isaacrehg/SWE_rebench_v2-GLM5.1-multiharness
-    #   dataset_config: hermes
-    #   name: swe-rebench-hermes
-    #   n_samples: 10
-    #   max_length: 24_000
+    - dataset: isaacrehg/SWE_rebench_v2-GLM5.1-multiharness
+      dataset_config: no_hermes
+      name: swe-rebench-mixed
+      n_samples: 10
+      max_length: 24_000
+    - dataset: isaacrehg/SWE_rebench_v2-GLM5.1-multiharness
+      dataset_config: hermes
+      name: swe-rebench-hermes
+      n_samples: 10
+      max_length: 24_000
 
 spec_dec_batch_size: 1
 baseline_eval_on_start: true
@@ -162,21 +162,21 @@ spec_dec_eval:
       temperature: 0.0
       max_characters: 3_500
       max_length: 24_000
-    # - dataset: isaacrehg/SWE_rebench_v2-GLM5.1-multiharness
-    #   dataset_config: no_hermes
-    #   name: swe-rebench-mixed
-    #   n_samples: 4
-    #   n_drafts: 1
-    #   d_tokens: 16
-    #   temperature: 0.0
-    #   max_characters: 3_500
-    #   max_length: 24_000
-    # - dataset: isaacrehg/SWE_rebench_v2-GLM5.1-multiharness
-    #   dataset_config: hermes
-    #   name: swe-rebench-hermes
-    #   n_samples: 4
-    #   n_drafts: 1
-    #   d_tokens: 16
-    #   temperature: 0.0
-    #   max_characters: 3_500
-    #   max_length: 24_000
+    - dataset: isaacrehg/SWE_rebench_v2-GLM5.1-multiharness
+      dataset_config: no_hermes
+      name: swe-rebench-mixed
+      n_samples: 4
+      n_drafts: 1
+      d_tokens: 16
+      temperature: 0.0
+      max_characters: 3_500
+      max_length: 24_000
+    - dataset: isaacrehg/SWE_rebench_v2-GLM5.1-multiharness
+      dataset_config: hermes
+      name: swe-rebench-hermes
+      n_samples: 4
+      n_drafts: 1
+      d_tokens: 16
+      temperature: 0.0
+      max_characters: 3_500
+      max_length: 24_000
