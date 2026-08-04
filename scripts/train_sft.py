@@ -73,7 +73,14 @@ class FullEvalConfig(BaseEvalConfig):
 
 
 def remap_roles(example):
-    for msg in example.get("conversations") or example.get("messages") or []:
+    for idx, msg in enumerate(example.get("conversations") or example.get("messages") or []):
+        # Qwen requires the system message to be first. Harness reminders injected
+        # later in a trajectory are time-local feedback, so preserve their position
+        # and render them as user messages.
+        if idx > 0 and msg.get("role") == "system":
+            msg["role"] = "user"
+        elif idx > 0 and msg.get("from") == "system":
+            msg["from"] = "human"
         if isinstance(msg, dict) and msg.get("from") in _ROLE_MAP:
             msg["from"] = _ROLE_MAP[msg["from"]]
     return example
@@ -458,6 +465,7 @@ def main(script_args, training_args, model_args, dataset_args, spec_dec_args):
         model=model,
         args=training_args,
         train_dataset=train_dataset,
+        processing_class=tokenizer,
         peft_config=get_peft_config(model_args),
         callbacks=callbacks if callbacks else None,
     )

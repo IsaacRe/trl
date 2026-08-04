@@ -23,6 +23,7 @@ All positions k are 1-indexed relative to the start of each draft iteration.
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import logging
 from dataclasses import dataclass, field
@@ -34,6 +35,7 @@ from accelerate import PartialState
 from accelerate.utils import gather_object
 from tqdm.auto import tqdm
 from transformers import DynamicCache, TrainerCallback, TrainerControl, TrainerState, TrainingArguments
+from transformers.cache_utils import CacheLayerMixin, LinearAttentionCacheLayerMixin
 
 from trl.chat_template_utils import get_training_chat_template
 
@@ -291,24 +293,44 @@ def _draft_from_caches(model, tokenizer, requests: list[dict], device: torch.dev
     lengths = [req["committed_len"] for req in requests]
     Lmax = max(lengths)
 
-    # Stack the per-sample committed caches into one (B, …, Lmax, …) batched cache,
-    # left-padding shorter rows; then expand to n drafts per request.
-    n_layers = len(requests[0]["kv"].layers)
-    ddp_data = []
-    for li in range(n_layers):
-        keys, vals = [], []
-        for req, L in zip(requests, lengths):
-            k = req["kv"].layers[li].keys
-            v = req["kv"].layers[li].values
-            pad = Lmax - L
-            if pad:
-                k = torch.nn.functional.pad(k, (0, 0, pad, 0))
-                v = torch.nn.functional.pad(v, (0, 0, pad, 0))
-            keys.append(k)
-            vals.append(v)
-        ddp_data.append((torch.cat(keys, dim=0), torch.cat(vals, dim=0)))
-    past = DynamicCache(ddp_cache_data=ddp_data)
-    past.batch_repeat_interleave(n)
+    linear_cache = any(
+        isinstance(layer, LinearAttentionCacheLayerMixin) for layer in requests[0]["kv"].layers
+    )
+    if linear_cache and B > 1:
+        return [_draft_from_caches(model, tokenizer, [req], device)[0] for req in requests]
+    if linear_cache:
+        # Linear-attention recurrent states have no sequence axis, so they cannot be
+        # left-padded and concatenated like standard KV tensors. Hybrid models are
+        # uncommon in this evaluator and use small draft counts; clone each request's
+        # cache and expand only its batch dimension.
+        past = copy.deepcopy(requests[0]["kv"])
+        for layer in past.layers:
+            if isinstance(layer, LinearAttentionCacheLayerMixin):
+                if layer.is_conv_states_initialized:
+                    layer.conv_states = layer.conv_states.repeat_interleave(n, dim=0)
+                if layer.is_recurrent_states_initialized:
+                    layer.recurrent_states = layer.recurrent_states.repeat_interleave(n, dim=0)
+            if isinstance(layer, CacheLayerMixin):
+                layer.batch_repeat_interleave(n)
+    else:
+        # Stack the per-sample committed caches into one (B, …, Lmax, …) batched cache,
+        # left-padding shorter rows; then expand to n drafts per request.
+        n_layers = len(requests[0]["kv"].layers)
+        ddp_data = []
+        for li in range(n_layers):
+            keys, vals = [], []
+            for req, L in zip(requests, lengths):
+                k = req["kv"].layers[li].keys
+                v = req["kv"].layers[li].values
+                pad = Lmax - L
+                if pad:
+                    k = torch.nn.functional.pad(k, (0, 0, pad, 0))
+                    v = torch.nn.functional.pad(v, (0, 0, pad, 0))
+                keys.append(k)
+                vals.append(v)
+            ddp_data.append((torch.cat(keys, dim=0), torch.cat(vals, dim=0)))
+        past = DynamicCache(ddp_cache_data=ddp_data)
+        past.batch_repeat_interleave(n)
 
     # Attention mask over the cached context (0 on the left pad), the position of the
     # first draft token (= committed length), and the first-token logits — each
@@ -621,7 +643,12 @@ class SpeculativeAcceptanceCallback(TrainerCallback):
                     del ctx_out
 
                 # Step 2 — evaluate the assistant turn using the cached prefix.
-                eval_kv = prefix_kv
+                if prefix_kv is not None and any(
+                    isinstance(layer, LinearAttentionCacheLayerMixin) for layer in prefix_kv.layers
+                ):
+                    eval_kv = copy.deepcopy(prefix_kv)
+                else:
+                    eval_kv = prefix_kv
                 for chunk_start in range(n_context, seq_len, chunk_size):
                     chunk_end = min(chunk_start + chunk_size, seq_len)
                     with torch.inference_mode():
@@ -648,10 +675,11 @@ class SpeculativeAcceptanceCallback(TrainerCallback):
                         nothink_correct += (correct & ~tmask).sum().item()
                         nothink_tokens  += (lbl_mask & ~tmask).sum().item()
                     del out
-                # ``eval_kv`` aliases ``prefix_kv`` and DynamicCache mutates in place,
-                # so the turn's tokens were appended to the persistent prefix. Crop
-                # them back out: the prefix must contain exactly the context render.
-                prefix_kv.crop(prefix_len)
+                # Standard DynamicCache mutates the persistent prefix in place, so
+                # crop the evaluated turn back out. Linear-attention recurrent state
+                # cannot be cropped and was evaluated on a copy instead.
+                if eval_kv is prefix_kv:
+                    prefix_kv.crop(prefix_len)
                 del eval_kv
 
                 # Step 3 — build the prefix cache for the next turn.
@@ -823,7 +851,7 @@ class SpeculativeAcceptanceCallback(TrainerCallback):
                 # only grow the context, so stop rather than skip.
                 if entry.max_length is not None and len(committed_ids) > entry.max_length:
                     break
-                kv = DynamicCache()
+                kv = DynamicCache(config=model.config)
                 next_logits, kv = _forward_extend(model, kv, committed_ids, 0, device)
 
                 for step in range(128_000):  # hard cap on iterations per turn
