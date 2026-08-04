@@ -1,0 +1,135 @@
+# Full SFT: kogai/laneformer-2b-it on a GLM-5.1 reasoning + agent mix.
+#
+# Adapted from configs/Qwen3.5-2B/GLM-5.1-mixed/sft_full.yaml for Laneformer's custom
+# "delayed TP" architecture. Key differences from the Qwen config:
+#   - trust_remote_code (custom modeling code, not in Transformers)
+#   - full fine-tuning, NOT LoRA (PEFT can't wrap the custom LaneLinear layers)
+#   - gradient_checkpointing off (the model sets supports_gradient_checkpointing = False)
+#   - use_liger_kernel off (no Liger patch for `laneformer`; 32k vocab makes it unnecessary)
+#   - max_length 4096 everywhere — the model's max_position_embeddings is 4096, so we
+#     train/eval on (mostly) reasoning traces that fit in the first 4096 tokens.
+# Reasoning is templated inline (reasoning, blank line, final response — no <think> tags)
+# and tool messages render as user turns; see trl/chat_templates/laneformer_training.jinja.
+#
+# Single-GPU run (fits the 2.3B model + Adam on one 97 GB GPU). Launch with:
+#   CUDA_VISIBLE_DEVICES=0 .venv/bin/python scripts/train_sft.py \
+#     --config configs/laneformer-2b-it/GLM-5.1-mixed/sft_full.yaml
+
+# Dataset — reasoning-heavy Jackrong stream as the bulk, plus a 20% slice of agentic
+# hermes traces (tool calls/responses, now supported). The first 50 rows of each are
+# held out from training and used for eval below.
+dataset_train_split: train
+dataset_streaming: true
+interleave_datasets:
+  - path: Jackrong/GLM-5.1-Reasoning-1M-Cleaned
+    name: main
+    streaming: true    # 100K–1M rows, stays streamed
+    skip_samples: 50
+  - path: lambda/hermes-agent-reasoning-traces
+    name: glm-5.1
+    streaming: false
+    shuffle: true
+    skip_samples: 50
+    ratio: 0.2
+
+# Model
+model_name_or_path: kogai/laneformer-2b-it
+trust_remote_code: true
+dtype: bfloat16
+attn_implementation: sdpa
+
+# Output
+output_dir: ""
+run_name: glm_mixed_sft
+
+# Training hyperparameters
+max_steps: 3_000
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 16
+learning_rate: 1.0e-5
+lr_scheduler_type: cosine
+warmup_ratio: 0.05
+weight_decay: 0.01
+
+# Sequence length — capped at the model's context window (max_position_embeddings=4096).
+max_length: 4_096
+packing: false
+
+# Precision & memory
+bf16: true
+# Laneformer's custom modeling sets supports_gradient_checkpointing = False, so we cannot
+# enable checkpointing; the 2.3B model trains full-FT within memory at batch 1 / 4096 len.
+gradient_checkpointing: false
+# No Liger kernel for the `laneformer` model type (and its vocab_parallel lane head is
+# incompatible with fused linear CE); the 32k vocab keeps logits cheap anyway.
+use_liger_kernel: false
+
+# Loss mode — train on ALL assistant turns. The Laneformer training template renders the
+# inline reasoning (no <think> tags) and wraps assistant output in {% generation %} markers.
+assistant_only_loss: true
+
+# Logging & evaluation
+logging_steps: 1
+eval_strategy: "no"
+save_strategy: steps
+save_steps: 500
+save_total_limit: 2
+
+# Misc
+dataloader_num_workers: 1
+ddp_timeout: 900
+
+# Full forward-pass eval (loss, token accuracy). All entries capped at 4096 tokens.
+full_eval:
+  eval_steps: 200
+  datasets:
+    # First 50 rows of Jackrong — the samples skipped during training.
+    - dataset: Jackrong/GLM-5.1-Reasoning-1M-Cleaned
+      dataset_config: main
+      name: reasoning-heldout
+      n_samples: 10
+      max_length: 4_096
+    - dataset: lambda/hermes-agent-reasoning-traces
+      dataset_config: glm-5.1
+      name: hermes-heldout
+      n_samples: 10
+      max_length: 4_096
+    - dataset: isaacrehg/Nemotron_Terminal_Synthetic_Tasks-GLM5.1-multiharness
+      dataset_config: hermes
+      name: nemotron-hermes
+      n_samples: 10
+      max_length: 4_096
+
+spec_dec_batch_size: 1
+baseline_eval_on_start: true
+spec_dec_eval:
+  eval_steps: 400
+  datasets:
+    # First 50 rows of Jackrong — the samples skipped during training.
+    - dataset: Jackrong/GLM-5.1-Reasoning-1M-Cleaned
+      dataset_config: main
+      name: reasoning-heldout
+      n_samples: 4
+      n_drafts: 1
+      d_tokens: 16
+      temperature: 0.0
+      max_characters: 3_500
+      max_length: 4_096
+    - dataset: lambda/hermes-agent-reasoning-traces
+      dataset_config: glm-5.1
+      name: hermes-heldout
+      n_samples: 4
+      n_drafts: 1
+      d_tokens: 16
+      temperature: 0.0
+      max_characters: 3_500
+      max_length: 4_096
+    - dataset: isaacrehg/Nemotron_Terminal_Synthetic_Tasks-GLM5.1-multiharness
+      dataset_config: hermes
+      name: nemotron-hermes
+      n_samples: 4
+      n_drafts: 1
+      d_tokens: 16
+      temperature: 0.0
+      max_characters: 3_500
+      max_length: 4_096

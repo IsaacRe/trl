@@ -193,3 +193,18 @@ Wrap assistant message output with `{% generation %}` / `{% endgeneration %}` so
 ### `qwen3_6_training.jinja`
 
 Patched Qwen3.6 template. Same diff as `qwen3_training.jinja` (require both `<think>` and `</think>` before parsing, drop the `loop.index0 > ns.last_query_index` conditional so the thinking block is always emitted, wrap assistant output in `{% generation %}` / `{% endgeneration %}`), applied to the Qwen3.6 base template.
+
+### `laneformer_training.jinja`
+
+Training variant of the Laneformer template (`laneformer.jinja`). Unlike the other training
+templates, it changes the format rather than only adding masking markers, because the base
+template drops system messages and rejects every non user/assistant role. Diff vs the original:
+
+- Renders a system block and always appends a reason-step-by-step instruction to it (the
+  original ignores system messages), so the model is prompted to reason before answering.
+- Renders `tool` messages as user turns (the original raises on any non user/assistant role).
+- Wraps assistant output in `{% generation %}` / `{% endgeneration %}` for assistant-only loss.
+
+Reasoning is carried inline in the assistant `content` (reasoning text, a blank line, then the
+final response — no `<think>` tags); callers strip any `<think>` blocks beforehand via
+`speculative_eval.to_reasoning_format`.

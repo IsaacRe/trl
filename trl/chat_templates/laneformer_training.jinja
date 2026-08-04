@@ -1,0 +1,37 @@
+{#- Training variant of the Laneformer chat template (see laneformer.jinja for the original).
+    Modifications vs the original:
+    - Renders a system block and always appends a reason-step-by-step instruction to it, so
+      the model is prompted to reason before answering (the original drops system messages).
+    - Renders `tool` messages as user turns (the original raises on any non user/assistant role).
+    - Wraps assistant output in {% generation %} / {% endgeneration %} for assistant-only loss
+      masking in SFT training.
+    Reasoning is expected inline in assistant `content` — reasoning text, a blank line, then the
+    final response, with no <think> tags. The caller strips any <think> blocks beforehand.
+-#}
+{{- bos_token }}
+{{- '<|start_header_id|>system<|end_header_id|>\n\n' }}
+{%- if messages and messages[0]['role'] == 'system' %}
+    {{- messages[0]['content'] | trim + '\n\n' }}
+{%- endif %}
+{{- 'Reason step by step, then give your final response.' }}
+{{- eos_token }}
+{%- for message in messages %}
+    {%- if message['role'] == 'system' %}
+        {#- The first system message is rendered in the block above; skip it here. #}
+    {%- elif message['role'] == 'user' or message['role'] == 'tool' %}
+        {{- '<|start_header_id|>user<|end_header_id|>\n\n' }}
+        {{- message['content'] | trim }}
+        {{- eos_token }}
+    {%- elif message['role'] == 'assistant' %}
+        {{- '<|start_header_id|>assistant<|end_header_id|>\n\n' }}
+        {%- generation %}
+        {{- message['content'] | trim }}
+        {{- eos_token }}
+        {%- endgeneration %}
+    {%- else %}
+        {{- raise_exception("Unsupported role: " + message['role']) }}
+    {%- endif %}
+{%- endfor %}
+{%- if add_generation_prompt %}
+    {{- '<|start_header_id|>assistant<|end_header_id|>\n\n' }}
+{%- endif %}

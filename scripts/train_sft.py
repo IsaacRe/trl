@@ -35,7 +35,13 @@ from transformers import AutoTokenizer
 
 sys.path.insert(0, os.path.dirname(__file__))
 
-from speculative_eval import FullEvalEntry, SpecDecConfig, SpecDecEvalEntry, SpeculativeAcceptanceCallback
+from speculative_eval import (
+    FullEvalEntry,
+    SpecDecConfig,
+    SpecDecEvalEntry,
+    SpeculativeAcceptanceCallback,
+    to_reasoning_format,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -231,7 +237,9 @@ def main(script_args, training_args, model_args, dataset_args, spec_dec_args):
         model_kwargs["device_map"] = get_kbit_device_map()
         model_kwargs["quantization_config"] = quantization_config
 
-    config = AutoConfig.from_pretrained(model_args.model_name_or_path)
+    config = AutoConfig.from_pretrained(
+        model_args.model_name_or_path, trust_remote_code=model_args.trust_remote_code
+    )
     valid_image_text_architectures = MODEL_FOR_IMAGE_TEXT_TO_TEXT_MAPPING_NAMES.values()
 
     # The "Loading weights" bar only mmaps the shards (instant). The real cost is
@@ -268,7 +276,21 @@ def main(script_args, training_args, model_args, dataset_args, spec_dec_args):
         rss_thread.join(timeout=3)
     logger.warning("Model materialized in %.1fs (RSS now %.1f GB)", time.time() - t_model, _proc_rss_gb())
 
-    tokenizer = AutoTokenizer.from_pretrained(model_args.model_name_or_path)
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_args.model_name_or_path, trust_remote_code=model_args.trust_remote_code
+    )
+
+    # Laneformer carries reasoning inline in the assistant content (no <think> tags) and its
+    # training template renders that content verbatim. Detect it from the resolved training
+    # template so training samples and eval samples get the same reasoning-format conversion.
+    from trl.chat_template_utils import get_training_chat_template, laneformer_training_chat_template
+
+    reasoning_inline = get_training_chat_template(tokenizer) == laneformer_training_chat_template
+    if reasoning_inline:
+        # The Laneformer template emits <s> itself, so stop the tokenizer from prepending a
+        # second bos in the eval helpers' plain encode()/__call__ calls — that would make eval
+        # inputs diverge from training (apply_chat_template tokenizes with add_special_tokens=False).
+        tokenizer.add_bos_token = False
 
     # ------------------------------------------------------------------
     # Dataset
@@ -344,8 +366,18 @@ def main(script_args, training_args, model_args, dataset_args, spec_dec_args):
     else:
         raise ValueError("Either `datasets`, `dataset_name`, or `interleave_datasets` must be provided.")
 
-    # Remap ShareGPT role names and convert to ChatML format before TRL processes them
-    dataset = dataset.map(lambda ex: maybe_convert_to_chatml(remap_roles(ex)))
+    # Remap ShareGPT role names and convert to ChatML format before TRL processes them.
+    # For the inline-reasoning format (Laneformer), also strip <think> tags from assistant
+    # content into `reasoning\n\nresponse` so training targets match the eval targets.
+    def _preprocess_example(ex: dict) -> dict:
+        ex = maybe_convert_to_chatml(remap_roles(ex))
+        if reasoning_inline:
+            for msg in ex.get("messages") or []:
+                if msg.get("role") == "assistant":
+                    msg["content"] = to_reasoning_format(msg.get("content") or "")
+        return ex
+
+    dataset = dataset.map(_preprocess_example)
     logger.info("Training dataset ready in %.1fs. Building eval sets…", time.time() - _t_data)
 
     # ------------------------------------------------------------------
@@ -376,7 +408,7 @@ def main(script_args, training_args, model_args, dataset_args, spec_dec_args):
             logger.info("  [%s] materializing full dataset to shuffle (non-streaming)…", cfg.name)
             src = src.shuffle(seed=training_args.seed)
         raw = [
-            maybe_convert_to_chatml(remap_roles(dict(s)))
+            _preprocess_example(dict(s))
             for s in tqdm(
                 itertools.islice(src, start, stop),
                 total=cfg.n_samples,

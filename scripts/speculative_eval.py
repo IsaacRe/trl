@@ -37,7 +37,7 @@ from tqdm.auto import tqdm
 from transformers import DynamicCache, TrainerCallback, TrainerControl, TrainerState, TrainingArguments
 from transformers.cache_utils import CacheLayerMixin, LinearAttentionCacheLayerMixin
 
-from trl.chat_template_utils import get_training_chat_template
+from trl.chat_template_utils import get_training_chat_template, laneformer_training_chat_template
 
 
 logger = logging.getLogger(__name__)
@@ -117,6 +117,25 @@ def _qwen3_open_think_block(prompt: str) -> str:
     return prompt
 
 
+_THINK_BLOCK_RE = re.compile(r"^\s*<think>(.*?)</think>(.*)$", re.DOTALL)
+
+
+def to_reasoning_format(content: str) -> str:
+    """Convert a GLM/Qwen ``<think>…</think>`` assistant message into the inline reasoning
+    format Laneformer trains on: the reasoning text, a blank line, then the final response,
+    with no ``<think>`` tags.
+
+    Messages without a think block — or with an empty one (``<think>\\n</think>``) — return
+    just their stripped content. Used both when preprocessing training samples and when
+    loading eval samples so training and eval see byte-identical assistant targets.
+    """
+    m = _THINK_BLOCK_RE.match(content or "")
+    if not m:
+        return (content or "").strip()
+    reasoning, answer = m.group(1).strip(), m.group(2).strip()
+    return f"{reasoning}\n\n{answer}" if reasoning else answer
+
+
 def _tools_from_sample(sample: dict):
     """Tool schemas for the chat template, or ``None``.
 
@@ -128,7 +147,7 @@ def _tools_from_sample(sample: dict):
 
 
 def _build_sequence_with_labels(
-    messages: list[dict], tokenizer, tools=None, chat_template=None
+    messages: list[dict], tokenizer, tools=None, chat_template=None, reasoning_inline=False
 ) -> tuple[list[int], list[int], list[bool]]:
     """
     Tokenize the full conversation and return ``(input_ids, labels, think_mask)``.
@@ -140,6 +159,9 @@ def _build_sequence_with_labels(
     The think block is located by searching the formatted assistant turn text
     (not ``content`` directly) so it works regardless of whether the dataset
     stores reasoning in ``content`` or a separate field handled by the template.
+
+    When ``reasoning_inline`` is set (Laneformer's format, which carries no ``<think>``
+    tags) the think mask is left all-``False`` — the think/no-think split does not apply.
     """
     if not messages or messages[-1]["role"] != "assistant":
         raise ValueError("last message must be an assistant message")
@@ -162,7 +184,7 @@ def _build_sequence_with_labels(
     # Search in the formatted turn text so we find the block even when content
     # doesn't include <think> tags (template injects them from a separate field).
     assistant_turn_text = full_text[len(context_text):]
-    m = re.search(r"^<think>.*?</think>\n\n", assistant_turn_text, re.DOTALL)
+    m = None if reasoning_inline else re.search(r"^<think>.*?</think>\n\n", assistant_turn_text, re.DOTALL)
     if m:
         n_think_end = min(
             len(tokenizer.encode(context_text + assistant_turn_text[:m.end()])),
@@ -174,19 +196,33 @@ def _build_sequence_with_labels(
     return full_ids, labels, think_mask
 
 
-def _assistant_turns(messages: list[dict], tokenizer, tools=None, chat_template=None) -> list[tuple[str, str, list[dict]]]:
+def _assistant_turns(messages: list[dict], tokenizer, tools=None, chat_template=None, reasoning_inline=False) -> list[tuple[str, str, list[dict]]]:
     """
     Return ``(context, target, turn_messages)`` for every assistant turn.
 
     ``context`` is the templated prompt ending with the generation prefix (``<think>\\n``).
     ``target`` is the assistant content with the leading ``<think>\\n`` stripped.
     ``turn_messages`` is ``messages[:i+1]``, used for the parity check.
+
+    When ``reasoning_inline`` is set (Laneformer's format), the generation prompt does not
+    pre-open a ``<think>`` block, so the whole (trimmed) content is the target and the
+    context is just the plain generation prompt.
     """
     turns = []
     for i, msg in enumerate(messages):
         if msg["role"] != "assistant":
             continue
         content = msg.get("content") or ""
+        if reasoning_inline:
+            target = content.strip()
+            if not target:
+                continue
+            context = tokenizer.apply_chat_template(
+                messages[:i], tools=tools, tokenize=False, add_generation_prompt=True,
+                chat_template=chat_template,
+            )
+            turns.append((context, target, messages[:i + 1]))
+            continue
         if content.startswith("<think>\n"):
             target = content[len("<think>\n"):]
         else:
@@ -416,15 +452,19 @@ def _lcp_len(a: str, b: str) -> int:
 
 
 def _first_token_chars(text: str, tokenizer) -> int:
-    """Char length of the smallest leading token-run of ``text`` that ends on a clean
-    (round-trippable) character boundary — normally a single token. Used to force-commit
-    the speculative-decoding correction token at the mismatch position."""
-    ids = tokenizer.encode(text[:50])
-    cnt, prefix = 0, ""
-    while (cnt == 0 or text[: len(prefix)] != prefix) and cnt < len(ids):
-        cnt += 1
-        prefix = tokenizer.decode(ids[:cnt])
-    return len(prefix)
+    """Number of characters owned by the first (char-bearing) token of ``text``. Used to
+    force-commit exactly one speculative-decoding correction token at the mismatch position.
+
+    Uses the fast tokenizer's char offset mapping, which is exact for both byte-level BPE and
+    SentencePiece. This matters for SentencePiece (e.g. Laneformer's Llama tokenizer): its
+    decode is context-dependent (a leading zero-width ``▁`` token, dummy prefix spaces), so
+    the older decode-round-trip approach either returned 0 (stalling the caller) or over-shot
+    a whole token run. The first offset with ``end > 0`` skips the zero-width prefix token."""
+    enc = tokenizer(text[:50], return_offsets_mapping=True, add_special_tokens=False)
+    for _start, end in enc["offset_mapping"]:
+        if end > 0:
+            return end
+    return len(text[:50])
 
 
 def _accepted_tokens(draft_ids: list[int], target_remaining: str, tokenizer) -> tuple[int, int]:
@@ -482,6 +522,10 @@ class SpeculativeAcceptanceCallback(TrainerCallback):
         # keeps eval contexts byte-identical to the training format. ``None`` falls
         # back to the tokenizer's own template, mirroring the trainer.
         self.chat_template = get_training_chat_template(tokenizer)
+        # Laneformer carries its reasoning inline (no <think> tags) and its generation
+        # prompt doesn't pre-open a think block, so the eval helpers take a dedicated
+        # path (no <think> stripping, no think/no-think split).
+        self.reasoning_inline = self.chat_template == laneformer_training_chat_template
 
     def on_train_begin(
         self,
@@ -595,22 +639,31 @@ class SpeculativeAcceptanceCallback(TrainerCallback):
             if not messages:
                 continue
             tools = _tools_from_sample(sample)
-            for m in messages:
-                if m["role"] == "assistant":
-                    m["content"] = _qwen3_convert_glm_think_blocks(m["content"])
+            if not self.reasoning_inline:
+                for m in messages:
+                    if m["role"] == "assistant":
+                        m["content"] = _qwen3_convert_glm_think_blocks(m["content"])
 
             asst_indices = [i for i, m in enumerate(messages) if m["role"] == "assistant"]
-            prefix_kv  = None
+            # Laneformer has sliding-window layers: if we let the model auto-create the cache
+            # (past_key_values=None) it builds DynamicSlidingWindowLayers, which cannot be
+            # cropped once they exceed the window (as this cross-turn evaluator does). Seed a
+            # plain full cache instead — the model still applies the per-layer sliding mask.
+            def _fresh_prefix():
+                return DynamicCache() if self.reasoning_inline else None
+
+            prefix_kv  = _fresh_prefix()
             prefix_len = 0  # tokens already in prefix_kv
 
             for turn_num, asst_idx in enumerate(asst_indices):
                 turn_messages = messages[:asst_idx + 1]
                 try:
                     input_ids, label_ids, think_mask = _build_sequence_with_labels(
-                        turn_messages, self.tokenizer, tools=tools, chat_template=self.chat_template
+                        turn_messages, self.tokenizer, tools=tools, chat_template=self.chat_template,
+                        reasoning_inline=self.reasoning_inline,
                     )
                 except ValueError:
-                    prefix_kv  = None
+                    prefix_kv  = _fresh_prefix()
                     prefix_len = 0
                     continue
 
@@ -696,6 +749,11 @@ class SpeculativeAcceptanceCallback(TrainerCallback):
                         chat_template=self.chat_template,
                     )
                     next_ctx_ids = self.tokenizer.encode(next_ctx_text)
+                    # Never build a prefix past the model's context window: forwarding
+                    # positions beyond max_length would exceed max_position_embeddings.
+                    # Later turns only grow the context, so stop this sample here.
+                    if entry.max_length is not None and len(next_ctx_ids) > entry.max_length:
+                        break
                     if len(next_ctx_ids) > prefix_len:
                         new_tokens = torch.tensor(
                             [next_ctx_ids[prefix_len:]], dtype=torch.long, device=device
@@ -812,11 +870,13 @@ class SpeculativeAcceptanceCallback(TrainerCallback):
 
             # convert GLM-style <think> blocks to Qwen3 if needed
             tools = _tools_from_sample(sample)
-            for m in messages:
-                if m["role"] == "assistant":
-                    m["content"] = _qwen3_convert_glm_think_blocks(m["content"])
+            if not self.reasoning_inline:
+                for m in messages:
+                    if m["role"] == "assistant":
+                        m["content"] = _qwen3_convert_glm_think_blocks(m["content"])
 
-            turns = _assistant_turns(messages, tokenizer, tools=tools, chat_template=self.chat_template)
+            turns = _assistant_turns(messages, tokenizer, tools=tools, chat_template=self.chat_template,
+                                     reasoning_inline=self.reasoning_inline)
             chars_consumed = 0
             budget_exhausted = False
 
@@ -845,13 +905,19 @@ class SpeculativeAcceptanceCallback(TrainerCallback):
                 # (cross-step reuse) instead of re-prefilling the whole context. Draft
                 # tokens are never committed to this cache — only accepted text is.
                 committed_ids = tokenizer(prompt).input_ids
-                # Stop the sample once a turn's context exceeds max_length tokens — the
-                # KV cache (and its padded copy in the draft batch) scales with context
-                # length and can exhaust GPU memory on long agent traces. Later turns
-                # only grow the context, so stop rather than skip.
-                if entry.max_length is not None and len(committed_ids) > entry.max_length:
+                # Stop the sample once a turn's context (plus the d draft tokens the next
+                # decode appends) would exceed max_length — this both bounds GPU memory on
+                # long agent traces and keeps positions within max_position_embeddings, so
+                # the drafting forward never indexes past the model's context window. Later
+                # turns only grow the context, so stop rather than skip.
+                if entry.max_length is not None and len(committed_ids) + entry.d_tokens > entry.max_length:
                     break
-                kv = DynamicCache(config=model.config)
+                # Laneformer has sliding-window layers; a config-built cache uses
+                # DynamicSlidingWindowLayer, which can't be cropped or left-pad-stacked once it
+                # exceeds the window. A plain full cache stores all K/V and the model still
+                # applies the per-layer sliding mask (verified equivalent to an uncached forward),
+                # so cross-step crop and the draft-batch stacking stay valid.
+                kv = DynamicCache() if self.reasoning_inline else DynamicCache(config=model.config)
                 next_logits, kv = _forward_extend(model, kv, committed_ids, 0, device)
 
                 for step in range(128_000):  # hard cap on iterations per turn
@@ -860,6 +926,11 @@ class SpeculativeAcceptanceCallback(TrainerCallback):
                         break
                     if entry.max_characters is not None and chars_consumed >= entry.max_characters:
                         budget_exhausted = True
+                        break
+                    # As accepted text is committed the context grows; stop before the next
+                    # d-token draft would push positions past max_length (see the turn-start
+                    # guard above). Advancing the char budget on to the next turn is fine.
+                    if entry.max_length is not None and len(committed_ids) + entry.d_tokens > entry.max_length:
                         break
 
                     in_think = accepted_char_pos < think_end_idx
@@ -884,6 +955,10 @@ class SpeculativeAcceptanceCallback(TrainerCallback):
                     best_lcp = len(tokenizer.decode(all_ids[best_idx][:best_k]))
                     rest = target_text[accepted_char_pos + best_lcp:]
                     advanced = best_lcp + (_first_token_chars(rest, tokenizer) if rest.strip() else 0)
+                    # Guard against a zero-width advance (e.g. a decode boundary that yields no
+                    # characters): without progress the step loop would spin until its hard cap.
+                    if advanced == 0:
+                        break
                     accepted_char_pos += advanced
                     chars_consumed += advanced
                     total_chars["n"] += advanced
