@@ -1,0 +1,136 @@
+# Full SFT: kogai/laneformer-2b-it, RoPE-scaled to a 32k context window.
+#
+# Same as sft_full.yaml but enables RoPE scaling so the model supports contexts well past
+# its native 4096. The Laneformer modeling code implements Llama-3-style RoPE scaling and
+# reads it from `config.rope_scaling`; `model_config_overrides` below is applied at
+# `from_pretrained` time (no need to edit the hub repo). max_position_embeddings is raised
+# to 32768 to match. Fine-tuning with the scaled frequencies is what adapts the model to the
+# longer window, so train (not just eval) with rope_scaling enabled.
+#
+#   CUDA_VISIBLE_DEVICES=0 .venv/bin/python scripts/train_sft.py \
+#     --config configs/laneformer-2b-it/GLM-5.1-mixed/sft_full_32k.yaml
+
+# ---- Extended-context: RoPE scaling (8x: 4096 -> 32768) + raised position limit --------
+model_config_overrides:
+  max_position_embeddings: 32768
+  rope_scaling:
+    # Llama-3-style scaling (the schema Laneformer's RoPEScalingArgs expects).
+    scaling_factor: 8.0
+    low_freq_factor: 1.0
+    high_freq_factor: 4.0
+    original_max_position_embeddings: 4096
+
+# Dataset — with 32k context the long agentic hermes traces are no longer mostly truncated,
+# so bump its share of the mix relative to the 4096 config.
+dataset_train_split: train
+dataset_streaming: true
+interleave_datasets:
+  - path: Jackrong/GLM-5.1-Reasoning-1M-Cleaned
+    name: main
+    streaming: true
+    skip_samples: 50
+  - path: lambda/hermes-agent-reasoning-traces
+    name: glm-5.1
+    streaming: false
+    shuffle: true
+    skip_samples: 50
+    ratio: 0.35
+
+# Model
+model_name_or_path: kogai/laneformer-2b-it
+trust_remote_code: true
+dtype: bfloat16
+attn_implementation: sdpa
+
+# Output
+output_dir: ""
+run_name: glm_mixed_sft_32k
+
+# Training hyperparameters
+max_steps: 3_000
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 16
+learning_rate: 1.0e-5
+lr_scheduler_type: cosine
+warmup_ratio: 0.05
+weight_decay: 0.01
+
+# Sequence length — the extended window. NOTE ON MEMORY: this model has no gradient
+# checkpointing (unsupported) and its lanes expand activations ~8x, so a full-length 32k
+# sample is very heavy at full FT. Most reasoning samples are far shorter (batch size 1, no
+# packing, so memory tracks each sample's true length); if a long sample OOMs, lower this.
+max_length: 32_000
+packing: false
+
+# Precision & memory
+bf16: true
+gradient_checkpointing: false
+use_liger_kernel: false
+
+assistant_only_loss: true
+
+# Logging & evaluation
+logging_steps: 1
+eval_strategy: "no"
+save_strategy: steps
+save_steps: 500
+save_total_limit: 2
+
+# Misc
+dataloader_num_workers: 1
+ddp_timeout: 1800
+
+# Full forward-pass eval (forward-only, so much lighter than training at the same length).
+full_eval:
+  eval_steps: 200
+  datasets:
+    - dataset: Jackrong/GLM-5.1-Reasoning-1M-Cleaned
+      dataset_config: main
+      name: reasoning-heldout
+      n_samples: 10
+      max_length: 32_000
+    - dataset: lambda/hermes-agent-reasoning-traces
+      dataset_config: glm-5.1
+      name: hermes-heldout
+      n_samples: 10
+      max_length: 32_000
+    - dataset: isaacrehg/Nemotron_Terminal_Synthetic_Tasks-GLM5.1-multiharness
+      dataset_config: hermes
+      name: nemotron-hermes
+      n_samples: 10
+      max_length: 32_000
+
+# Spec-dec eval — one sample in flight at a time; a 32k context KV cache is a few GB.
+spec_dec_batch_size: 1
+spec_dec_concurrency: 1
+baseline_eval_on_start: true
+spec_dec_eval:
+  eval_steps: 400
+  datasets:
+    - dataset: Jackrong/GLM-5.1-Reasoning-1M-Cleaned
+      dataset_config: main
+      name: reasoning-heldout
+      n_samples: 4
+      n_drafts: 1
+      d_tokens: 16
+      temperature: 0.0
+      max_characters: 3_500
+      max_length: 32_000
+    - dataset: lambda/hermes-agent-reasoning-traces
+      dataset_config: glm-5.1
+      name: hermes-heldout
+      n_samples: 4
+      n_drafts: 1
+      d_tokens: 16
+      temperature: 0.0
+      max_characters: 3_500
+      max_length: 32_000
+    - dataset: isaacrehg/Nemotron_Terminal_Synthetic_Tasks-GLM5.1-multiharness
+      dataset_config: hermes
+      name: nemotron-hermes
+      n_samples: 4
+      n_drafts: 1
+      d_tokens: 16
+      temperature: 0.0
+      max_characters: 3_500
+      max_length: 32_000
