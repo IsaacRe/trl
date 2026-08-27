@@ -119,21 +119,41 @@ def _qwen3_open_think_block(prompt: str) -> str:
 
 _THINK_BLOCK_RE = re.compile(r"^\s*<think>(.*?)</think>(.*)$", re.DOTALL)
 
+# Separator inserted between the reasoning and the final response in the inline format.
+_REASONING_SEP = "\n\n"
+
+
+def _split_reasoning(content: str) -> tuple[str, str]:
+    """Split a GLM/Qwen ``<think>…</think>`` assistant message into ``(reasoning, response)``,
+    both stripped. No think block — or an empty one (``<think>\\n</think>``) — yields an empty
+    reasoning and the stripped content as the response."""
+    m = _THINK_BLOCK_RE.match(content or "")
+    if not m:
+        return "", (content or "").strip()
+    return m.group(1).strip(), m.group(2).strip()
+
 
 def to_reasoning_format(content: str) -> str:
     """Convert a GLM/Qwen ``<think>…</think>`` assistant message into the inline reasoning
     format Laneformer trains on: the reasoning text, a blank line, then the final response,
-    with no ``<think>`` tags.
+    with no ``<think>`` tags. Empty/absent reasoning yields just the stripped response.
 
-    Messages without a think block — or with an empty one (``<think>\\n</think>``) — return
-    just their stripped content. Used both when preprocessing training samples and when
-    loading eval samples so training and eval see byte-identical assistant targets.
+    Used both when preprocessing training samples and when loading eval samples so training
+    and eval see byte-identical assistant targets.
     """
-    m = _THINK_BLOCK_RE.match(content or "")
-    if not m:
-        return (content or "").strip()
-    reasoning, answer = m.group(1).strip(), m.group(2).strip()
-    return f"{reasoning}\n\n{answer}" if reasoning else answer
+    reasoning, response = _split_reasoning(content)
+    return f"{reasoning}{_REASONING_SEP}{response}" if reasoning else response
+
+
+def reasoning_char_boundary(content: str) -> int:
+    """Char length of the reasoning region — the reasoning text plus the ``\\n\\n`` separator —
+    within the string returned by [`to_reasoning_format`]; ``0`` when there is no reasoning.
+
+    Carried onto each assistant message at preprocessing time (as ``reasoning_chars``) so the
+    eval can bucket tokens into reasoning vs response by an exact, unambiguous boundary rather
+    than re-detecting one (the reasoning text itself may contain blank lines)."""
+    reasoning, _ = _split_reasoning(content)
+    return len(reasoning) + len(_REASONING_SEP) if reasoning else 0
 
 
 def _tools_from_sample(sample: dict):
@@ -154,14 +174,15 @@ def _build_sequence_with_labels(
 
     ``messages[-1]`` MUST be an assistant message; raises ``ValueError`` otherwise.
     Labels are ``-100`` everywhere except the last assistant turn. ``think_mask``
-    is ``True`` for tokens inside the ``<think>...</think>`` block of that turn.
+    is ``True`` for the reasoning tokens of that turn (the rest are response tokens).
 
-    The think block is located by searching the formatted assistant turn text
-    (not ``content`` directly) so it works regardless of whether the dataset
-    stores reasoning in ``content`` or a separate field handled by the template.
+    In the default (``<think>...</think>``) format the reasoning block is located by
+    searching the formatted assistant turn text (not ``content`` directly) so it works
+    regardless of whether the dataset stores reasoning in ``content`` or a separate field.
 
     When ``reasoning_inline`` is set (Laneformer's format, which carries no ``<think>``
-    tags) the think mask is left all-``False`` — the think/no-think split does not apply.
+    tags), the reasoning region is the first ``reasoning_chars`` characters of the turn —
+    the exact boundary carried onto the message by [`reasoning_char_boundary`].
     """
     if not messages or messages[-1]["role"] != "assistant":
         raise ValueError("last message must be an assistant message")
@@ -181,13 +202,18 @@ def _build_sequence_with_labels(
     for pos in range(n_context, len(full_ids)):
         labels[pos] = full_ids[pos]
 
-    # Search in the formatted turn text so we find the block even when content
-    # doesn't include <think> tags (template injects them from a separate field).
+    # Locate the reasoning region within the formatted assistant turn text (chars), then map
+    # its end to a token position. For the inline format the boundary is the carried
+    # `reasoning_chars`; otherwise search the rendered <think>...</think> block.
     assistant_turn_text = full_text[len(context_text):]
-    m = None if reasoning_inline else re.search(r"^<think>.*?</think>\n\n", assistant_turn_text, re.DOTALL)
-    if m:
+    if reasoning_inline:
+        r_chars = min(messages[-1].get("reasoning_chars", 0), len(assistant_turn_text))
+    else:
+        m = re.search(r"^<think>.*?</think>\n\n", assistant_turn_text, re.DOTALL)
+        r_chars = m.end() if m else 0
+    if r_chars > 0:
         n_think_end = min(
-            len(tokenizer.encode(context_text + assistant_turn_text[:m.end()])),
+            len(tokenizer.encode(context_text + assistant_turn_text[:r_chars])),
             len(full_ids),
         )
         for pos in range(n_context, n_think_end):
@@ -777,6 +803,9 @@ class SpeculativeAcceptanceCallback(TrainerCallback):
         if tt == 0:
             return {}
 
+        # Metric names stay `_think` / `_nothink` for ALL models so wandb plots line up across
+        # runs. For the inline (Laneformer) format the reasoning region fills the `_think`
+        # bucket and the response region fills `_nothink` — same names, consistent meaning.
         result = {f"full_eval/{entry.name}/mean_token_accuracy": tc / tt}
         if tht > 0:
             result[f"full_eval/{entry.name}/mean_token_accuracy_think"]   = thc / tht
@@ -894,11 +923,17 @@ class SpeculativeAcceptanceCallback(TrainerCallback):
 
                 accepted_char_pos = 0
 
-                _think_sentinel = "</think>\n\n"
-                think_end_idx = (
-                    target_text.index(_think_sentinel) + len(_think_sentinel)
-                    if _think_sentinel in target_text else 0
-                )
+                # Char offset in target_text where reasoning ends and the response begins.
+                # Inline format: the exact boundary carried on the message; otherwise the end
+                # of the rendered <think>...</think> block.
+                if self.reasoning_inline:
+                    think_end_idx = min(turn_messages[-1].get("reasoning_chars", 0), len(target_text))
+                else:
+                    _think_sentinel = "</think>\n\n"
+                    think_end_idx = (
+                        target_text.index(_think_sentinel) + len(_think_sentinel)
+                        if _think_sentinel in target_text else 0
+                    )
 
                 # Persistent KV cache for this turn's committed context. The prompt is
                 # prefilled once; each step then forwards only the newly-accepted tokens
@@ -1007,6 +1042,10 @@ class SpeculativeAcceptanceCallback(TrainerCallback):
             by_name.setdefault(rec[0], []).append(rec)
 
         out: dict[str, float] = {}
+
+        # Metric names stay `_think` / `_nothink` for ALL models so wandb plots line up across
+        # runs. For the inline (Laneformer) format the reasoning region fills the `_think`
+        # bucket and the response region fills `_nothink` — same names, consistent meaning.
 
         # Acceptance length: mean tokens committed per speculative step. That's the mean
         # accepted draft tokens — k = #{pos : k > pos}, so E[k] = Σ_pos P(k > pos), the

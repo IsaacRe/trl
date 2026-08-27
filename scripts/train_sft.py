@@ -40,6 +40,7 @@ from speculative_eval import (
     SpecDecConfig,
     SpecDecEvalEntry,
     SpeculativeAcceptanceCallback,
+    reasoning_char_boundary,
     to_reasoning_format,
 )
 
@@ -237,8 +238,15 @@ def main(script_args, training_args, model_args, dataset_args, spec_dec_args):
         model_kwargs["device_map"] = get_kbit_device_map()
         model_kwargs["quantization_config"] = quantization_config
 
+    # Arbitrary `config.*` overrides from the YAML, forwarded to `from_pretrained` (which
+    # applies matching kwargs to the model config). Used e.g. to enable RoPE scaling and
+    # raise `max_position_embeddings` for extended-context training without editing the hub
+    # repo. Applied to both the config probe and the model load so they stay consistent.
+    config_overrides = _read_yaml_scalar(sys.argv, "model_config_overrides", {}) or {}
+    model_kwargs.update(config_overrides)
+
     config = AutoConfig.from_pretrained(
-        model_args.model_name_or_path, trust_remote_code=model_args.trust_remote_code
+        model_args.model_name_or_path, trust_remote_code=model_args.trust_remote_code, **config_overrides
     )
     valid_image_text_architectures = MODEL_FOR_IMAGE_TEXT_TO_TEXT_MAPPING_NAMES.values()
 
@@ -374,7 +382,11 @@ def main(script_args, training_args, model_args, dataset_args, spec_dec_args):
         if reasoning_inline:
             for msg in ex.get("messages") or []:
                 if msg.get("role") == "assistant":
-                    msg["content"] = to_reasoning_format(msg.get("content") or "")
+                    content = msg.get("content") or ""
+                    # Carry the reasoning/response boundary before rewriting content, so the
+                    # eval can split its metrics on an exact char offset (see reasoning_char_boundary).
+                    msg["reasoning_chars"] = reasoning_char_boundary(content)
+                    msg["content"] = to_reasoning_format(content)
         return ex
 
     dataset = dataset.map(_preprocess_example)
